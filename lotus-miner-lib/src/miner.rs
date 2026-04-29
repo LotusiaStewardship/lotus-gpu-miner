@@ -1,10 +1,10 @@
+use eyre::Result;
 use ocl::{
     builders::{DeviceSpecifier, ProgramBuilder},
     Buffer, Context, Device, Kernel, Platform, Queue,
 };
 use sha2::Digest;
 use std::convert::TryInto;
-use eyre::Result;
 use thiserror::Error;
 
 use crate::{sha256::lotus_hash, Log};
@@ -12,7 +12,7 @@ use crate::{sha256::lotus_hash, Log};
 #[derive(Debug, Error)]
 pub enum MinerError {
     #[error("Ocl error: {0:?}")]
-    Ocl(ocl::Error)
+    Ocl(ocl::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +111,8 @@ impl Miner {
         let ctx = Context::builder()
             .platform(platform.clone())
             .devices(DeviceSpecifier::Single(device.clone()))
-            .build().map_err(Ocl)?;
+            .build()
+            .map_err(Ocl)?;
         let queue = Queue::new(&ctx, device, None).map_err(Ocl)?;
         prog_builder.devices(DeviceSpecifier::Single(device.clone()));
         let program = prog_builder.build(&ctx).map_err(Ocl)?;
@@ -120,13 +121,22 @@ impl Miner {
             .program(&program)
             .name("search")
             .queue(queue.clone());
-        let buffer = Buffer::builder().len(0xff).queue(queue.clone()).build().map_err(Ocl)?;
-        let header_buffer = Buffer::builder().len(0xff).queue(queue).build().map_err(Ocl)?;
+        let buffer = Buffer::builder()
+            .len(0xff)
+            .queue(queue.clone())
+            .build()
+            .map_err(Ocl)?;
+        let header_buffer = Buffer::builder()
+            .len(0xff)
+            .queue(queue)
+            .build()
+            .map_err(Ocl)?;
         let search_kernel = kernel_builder
             .arg_named("offset", 0u32)
             .arg_named("partial_header", None::<&Buffer<u32>>)
             .arg_named("output", None::<&Buffer<u32>>)
-            .build().map_err(Ocl)?;
+            .build()
+            .map_err(Ocl)?;
         Ok(Miner {
             search_kernel,
             buffer,
@@ -183,10 +193,16 @@ impl Miner {
         for (chunk, int) in partial_header.chunks(4).zip(partial_header_ints.iter_mut()) {
             *int = u32::from_be_bytes(chunk.try_into().unwrap());
         }
-        self.header_buffer.write(&partial_header_ints[..]).enq().map_err(Ocl)?;
+        self.header_buffer
+            .write(&partial_header_ints[..])
+            .enq()
+            .map_err(Ocl)?;
         self.search_kernel
-            .set_arg("partial_header", &self.header_buffer).map_err(Ocl)?;
-        self.search_kernel.set_arg("output", &self.buffer).map_err(Ocl)?;
+            .set_arg("partial_header", &self.header_buffer)
+            .map_err(Ocl)?;
+        self.search_kernel
+            .set_arg("output", &self.buffer)
+            .map_err(Ocl)?;
         self.search_kernel.set_arg("offset", base).map_err(Ocl)?;
         let mut vec = vec![0; self.buffer.len()];
         self.buffer.write(&vec).enq().map_err(Ocl)?;

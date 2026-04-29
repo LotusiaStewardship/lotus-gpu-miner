@@ -5,6 +5,7 @@ mod sha256;
 
 use eyre::Result;
 pub use miner::Miner;
+use primitive_types::U256;
 pub use settings::ConfigSettings;
 
 use std::{
@@ -23,6 +24,7 @@ use rand::{Rng, SeedableRng};
 use reqwest::{RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::Digest;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
@@ -54,6 +56,7 @@ pub struct StratumSettings {
     pub stratum_url: Option<String>,
     pub stratum_worker_name: Option<String>,
     pub stratum_password: String,
+    pub stratum_extranonce1: String,
     pub stratum_extranonce2_size: usize,
     pub stratum_difficulty: f64,
 }
@@ -93,6 +96,12 @@ struct BlockState {
 #[derive(Debug, Clone)]
 struct StratumJob {
     job_id: String,
+    prevhash: String,
+    coinbase1: String,
+    coinbase2: String,
+    merkle_branches: Vec<String>,
+    version: String,
+    nbits: String,
     ntime_hex_6b: String,
     extranonce2: String,
 }
@@ -135,9 +144,8 @@ impl Server {
             stratum_settings: Mutex::new(StratumSettings {
                 stratum_url,
                 stratum_worker_name,
-                stratum_password: config
-                    .stratum_password
-                    .unwrap_or_else(|| "x".to_string()),
+                stratum_password: config.stratum_password.unwrap_or_else(|| "x".to_string()),
+                stratum_extranonce1: "00000000".to_string(),
                 stratum_extranonce2_size: 4,
                 stratum_difficulty: 1.0,
             }),
@@ -192,11 +200,14 @@ impl Server {
     async fn stratum_worker_full_name(&self) -> Result<String> {
         let miner_addr = self.node_settings.lock().await.miner_addr.clone();
         if miner_addr.trim().is_empty() {
-            return Err(eyre::eyre!(
-                "mine_to_address must be set for stratum mode"
-            ));
+            return Err(eyre::eyre!("mine_to_address must be set for stratum mode"));
         }
-        let worker_name = self.stratum_settings.lock().await.stratum_worker_name.clone();
+        let worker_name = self
+            .stratum_settings
+            .lock()
+            .await
+            .stratum_worker_name
+            .clone();
         let full = match worker_name {
             Some(worker) if !worker.is_empty() => format!("{}.{}", miner_addr, worker),
             _ => miner_addr,
@@ -276,7 +287,12 @@ async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()>
     let mut req_id: u64 = 1;
 
     let worker_name = server.stratum_worker_full_name().await?;
-    let stratum_password = server.stratum_settings.lock().await.stratum_password.clone();
+    let stratum_password = server
+        .stratum_settings
+        .lock()
+        .await
+        .stratum_password
+        .clone();
 
     let subscribe_id = req_id;
     req_id += 1;
@@ -364,9 +380,41 @@ async fn handle_stratum_line(
                     .get("params")
                     .and_then(|p| p.as_array())
                     .ok_or_else(|| eyre::eyre!("invalid mining.notify params"))?;
-                let job_id = params.get(0).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let job_id = params
+                    .get(0)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let prevhash =
+                    normalize_hex_len(params.get(1).and_then(|v| v.as_str()).unwrap_or(""), 64);
+                let coinbase1 = params
+                    .get(2)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let coinbase2 = params
+                    .get(3)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let merkle_branches = params
+                    .get(4)
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let version =
+                    normalize_hex_len(params.get(5).and_then(|v| v.as_str()).unwrap_or(""), 8);
+                let nbits =
+                    normalize_hex_len(params.get(6).and_then(|v| v.as_str()).unwrap_or(""), 8);
                 let ntime_hex_6b = normalize_hex_len(
-                    params.get(7).and_then(|v| v.as_str()).unwrap_or("000000000000"),
+                    params
+                        .get(7)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("000000000000"),
                     12,
                 );
                 let clean_jobs = params.get(8).and_then(|v| v.as_bool()).unwrap_or(false);
@@ -399,19 +447,27 @@ async fn handle_stratum_line(
                 if clean_jobs {
                     block_state.current_work.nonce_idx = 0;
                 }
-                let extranonce2_size = server.stratum_settings.lock().await.stratum_extranonce2_size;
+                let extranonce2_size = server
+                    .stratum_settings
+                    .lock()
+                    .await
+                    .stratum_extranonce2_size;
                 let extranonce2 = random_extranonce2(extranonce2_size);
                 block_state.stratum_job = Some(StratumJob {
                     job_id: job_id.clone(),
+                    prevhash,
+                    coinbase1,
+                    coinbase2,
+                    merkle_branches,
+                    version,
+                    nbits,
                     ntime_hex_6b,
                     extranonce2,
                 });
                 drop(block_state);
                 server.log().info(format!(
                     "Work update: mining.notify job_id={} clean_jobs={} difficulty={}",
-                    job_id,
-                    clean_jobs,
-                    difficulty
+                    job_id, clean_jobs, difficulty
                 ));
             }
             _ => {}
@@ -427,16 +483,26 @@ async fn handle_stratum_line(
                 .log()
                 .error(format!("mining.subscribe failed: {}", err.unwrap()));
         } else {
+            let extranonce1 = v
+                .get("result")
+                .and_then(|r| r.as_array())
+                .and_then(|a| a.get(1))
+                .and_then(|s| s.as_str())
+                .unwrap_or("00000000")
+                .to_string();
             let extranonce2_size = v
                 .get("result")
                 .and_then(|r| r.as_array())
                 .and_then(|a| a.get(2))
                 .and_then(|n| n.as_u64())
                 .unwrap_or(4) as usize;
-            server.stratum_settings.lock().await.stratum_extranonce2_size = extranonce2_size;
-            server
-                .log()
-                .info(format!("mining.subscribe OK extranonce2_size={}", extranonce2_size));
+            let mut settings = server.stratum_settings.lock().await;
+            settings.stratum_extranonce1 = extranonce1;
+            settings.stratum_extranonce2_size = extranonce2_size;
+            server.log().info(format!(
+                "mining.subscribe OK extranonce2_size={}",
+                extranonce2_size
+            ));
         }
     } else if id == authorize_id {
         if err.is_some() && !err.unwrap().is_null() {
@@ -459,7 +525,9 @@ async fn handle_stratum_line(
         if result_bool {
             server.log().info(format!("Share accepted id={}", id));
         } else {
-            server.log().warn(format!("Share rejected id={} (result=false)", id));
+            server
+                .log()
+                .warn(format!("Share rejected id={} (result=false)", id));
         }
     }
 
@@ -467,14 +535,75 @@ async fn handle_stratum_line(
 }
 
 fn difficulty_to_target(difficulty: f64) -> [u8; 32] {
-    // Conservative fallback target mapper for Stratum mode in this phase.
-    // A full compact-target conversion can replace this when server-side typed
-    // template integration is complete.
-    if difficulty <= 0.0 {
-        return [0xff; 32];
+    let target = target_for_share_difficulty(difficulty).unwrap_or_else(|_| U256::MAX);
+    let mut out = [0u8; 32];
+    target.to_big_endian(&mut out);
+    out
+}
+
+fn share_meets_server_target(
+    job: &StratumJob,
+    extranonce1: &str,
+    difficulty: f64,
+    nonce_hex_8b: &str,
+) -> Result<bool> {
+    let coinbase = hex::decode(format!(
+        "{}{}{}{}",
+        job.coinbase1, extranonce1, job.extranonce2, job.coinbase2
+    ))?;
+    let mut merkle = sha256d(&coinbase).to_vec();
+    for branch_hex in &job.merkle_branches {
+        let branch = hex::decode(branch_hex)?;
+        let mut concat = Vec::with_capacity(64);
+        concat.extend_from_slice(&merkle);
+        concat.extend_from_slice(&branch);
+        merkle = sha256d(&concat).to_vec();
     }
-    let scale = (255.0 / difficulty.sqrt()).clamp(1.0, 255.0) as u8;
-    [scale; 32]
+
+    let mut header = Vec::with_capacity(4 + 32 + 32 + 6 + 4 + 8);
+    header.extend_from_slice(&hex::decode(&job.version)?);
+    header.extend_from_slice(&hex::decode(&job.prevhash)?);
+    header.extend_from_slice(&merkle);
+    header.extend_from_slice(&hex::decode(&job.ntime_hex_6b)?);
+    header.extend_from_slice(&hex::decode(&job.nbits)?);
+    header.extend_from_slice(&hex::decode(nonce_hex_8b)?);
+
+    let mut hash_be = sha256d(&header);
+    hash_be.reverse();
+    let hash_u256 = U256::from_big_endian(&hash_be);
+    let share_target = target_for_share_difficulty(difficulty)?;
+    Ok(hash_u256 <= share_target)
+}
+
+fn target_for_share_difficulty(difficulty: f64) -> Result<U256> {
+    const DIFF1_TARGET_HEX: &str =
+        "00000000ffff0000000000000000000000000000000000000000000000000000";
+    const DIFF_SCALE: u128 = 100_000_000;
+
+    if difficulty <= 0.0 || !difficulty.is_finite() {
+        return Err(eyre::eyre!("invalid difficulty"));
+    }
+    let scaled = (difficulty * DIFF_SCALE as f64).round();
+    if scaled <= 0.0 || !scaled.is_finite() {
+        return Err(eyre::eyre!("invalid difficulty scale"));
+    }
+    let scaled_u = U256::from(scaled as u128);
+    let mut diff1_bytes = [0u8; 32];
+    let raw = hex::decode(DIFF1_TARGET_HEX)?;
+    diff1_bytes.copy_from_slice(&raw);
+    let diff1 = U256::from_big_endian(&diff1_bytes);
+    let scaled_diff1 = diff1 * U256::from(DIFF_SCALE);
+    let mut target = scaled_diff1 / scaled_u;
+    if target.is_zero() {
+        target = U256::one();
+    }
+    Ok(target)
+}
+
+fn sha256d(bytes: &[u8]) -> [u8; 32] {
+    let h1 = sha2::Sha256::digest(bytes);
+    let h2 = sha2::Sha256::digest(&h1);
+    h2.into()
 }
 
 fn random_extranonce2(extranonce2_size: usize) -> String {
@@ -517,7 +646,7 @@ async fn mine_some_nonces_stratum(
         move || {
             let mut miner = server.miner.lock().unwrap();
             if !miner.has_nonces_left(&work) {
-                return Ok((None, 0));
+                work.nonce_idx = 0;
             }
             miner
                 .find_nonce(&work, server.log())
@@ -528,7 +657,7 @@ async fn mine_some_nonces_stratum(
     .unwrap()?;
 
     let mut block_state = server.block_state.lock().await;
-    block_state.current_work.nonce_idx += 1;
+    block_state.current_work.nonce_idx = block_state.current_work.nonce_idx.wrapping_add(1);
     server
         .metrics_nonces
         .fetch_add(num_nonces_per_search, Ordering::AcqRel);
@@ -536,6 +665,17 @@ async fn mine_some_nonces_stratum(
 
     if let Some(nonce) = nonce {
         let nonce_hex = format!("{:016x}", nonce);
+        let settings = server.stratum_settings.lock().await;
+        let difficulty = settings.stratum_difficulty;
+        let extranonce1 = settings.stratum_extranonce1.clone();
+        drop(settings);
+        if !share_meets_server_target(&job, &extranonce1, difficulty, &nonce_hex)? {
+            log.warn(format!(
+                "Candidate filtered (below stratum difficulty): job_id={} extranonce2={} nonce={}",
+                job.job_id, job.extranonce2, nonce_hex
+            ));
+            return Ok(None);
+        }
         log.info(format!(
             "Candidate share job_id={} extranonce2={} nonce={}",
             job.job_id, job.extranonce2, nonce_hex
@@ -546,6 +686,10 @@ async fn mine_some_nonces_stratum(
             job.ntime_hex_6b,
             nonce_hex,
         )));
+    }
+
+    if block_state.current_work.nonce_idx == u32::MAX {
+        block_state.current_work.nonce_idx = 0;
     }
 
     Ok(None)

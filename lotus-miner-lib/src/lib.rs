@@ -319,6 +319,7 @@ async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()>
     server.log().info("Sent mining.authorize");
     server.log().info("Optional methods (extranonce.subscribe / suggest_difficulty / set_extranonce) are scaffolded but disabled by default");
 
+    let mut last_outbound = std::time::Instant::now();
     loop {
         line.clear();
         tokio::select! {
@@ -347,7 +348,21 @@ async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()>
                     writer_half
                         .write_all(format!("{}\n", submit).as_bytes())
                         .await?;
+                    last_outbound = std::time::Instant::now();
                     server.log().info(format!("Sent mining.submit id={}", submit_id));
+                } else if last_outbound.elapsed() >= Duration::from_secs(30) {
+                    let ping_id = req_id;
+                    req_id += 1;
+                    let ping = serde_json::json!({
+                        "id": ping_id,
+                        "method": "mining.ping",
+                        "params": []
+                    });
+                    writer_half
+                        .write_all(format!("{}\n", ping).as_bytes())
+                        .await?;
+                    last_outbound = std::time::Instant::now();
+                    server.log().info(format!("Sent mining.ping id={}", ping_id));
                 }
             }
         }

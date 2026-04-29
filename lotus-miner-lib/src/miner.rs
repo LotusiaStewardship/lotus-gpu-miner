@@ -163,9 +163,8 @@ impl Miner {
     }
 
     pub fn has_nonces_left(&self, work: &Work) -> bool {
-        work.nonce_idx
-            .checked_mul(self.settings.kernel_size)
-            .is_some()
+        let searched = (work.nonce_idx as u64).saturating_mul(self.num_nonces_per_search());
+        searched <= u32::MAX as u64
     }
 
     pub fn num_nonces_per_search(&self) -> u64 {
@@ -173,19 +172,15 @@ impl Miner {
     }
 
     pub fn find_nonce(&mut self, work: &Work, log: &Log) -> Result<Option<u64>> {
-        let base = match work
-            .nonce_idx
-            .checked_mul(self.num_nonces_per_search().try_into().unwrap())
-        {
-            Some(base) => base,
-            None => {
-                log.error(
-                    "Error: Nonce base overflow, skipping. This could be fixed by lowering \
+        let base_u64 = (work.nonce_idx as u64).saturating_mul(self.num_nonces_per_search());
+        if base_u64 > u32::MAX as u64 {
+            log.error(
+                "Error: Nonce base overflow, skipping. This could be fixed by lowering \
                            rpc_poll_interval.",
-                );
-                return Ok(None);
-            }
-        };
+            );
+            return Ok(None);
+        }
+        let base = base_u64 as u32;
         let mut partial_header = [0u8; 84];
         partial_header[..52].copy_from_slice(&work.header[..52]);
         partial_header[52..].copy_from_slice(&sha2::Sha256::digest(&work.header[52..]));

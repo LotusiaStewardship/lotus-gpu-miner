@@ -21,6 +21,9 @@ pub struct UserSettings {
     bitcoind_password: String,
     rpc_poll_interval: u64,
     gpu_index: i64,
+    stratum_url: String,
+    stratum_worker_name: String,
+    stratum_password: String,
 }
 
 pub struct MinerApp {
@@ -51,6 +54,11 @@ impl MinerApp {
                 bitcoind_password: config_settings.rpc_password,
                 rpc_poll_interval: config_settings.rpc_poll_interval.try_into().unwrap(),
                 gpu_index: config_settings.gpu_index,
+                stratum_url: config_settings.stratum_url.unwrap_or_default(),
+                stratum_worker_name: config_settings.stratum_worker_name.unwrap_or_default(),
+                stratum_password: config_settings
+                    .stratum_password
+                    .unwrap_or_else(|| settings::DEFAULT_STRATUM_PASSWORD.to_string()),
             },
             Err(err) => {
                 eprintln!("Failed to load config, falling back to defaults: {}", err);
@@ -62,6 +70,9 @@ impl MinerApp {
                     bitcoind_password: settings::DEFAULT_PASSWORD.to_string(),
                     rpc_poll_interval: settings::DEFAULT_RPC_POLL_INTERVAL.try_into().unwrap(),
                     gpu_index: settings::DEFAULT_GPU_INDEX,
+                    stratum_url: String::new(),
+                    stratum_worker_name: String::new(),
+                    stratum_password: settings::DEFAULT_STRATUM_PASSWORD.to_string(),
                 }
             }
         };
@@ -73,6 +84,9 @@ impl MinerApp {
             mine_to_address: user_settings.mine_to_address.clone(),
             kernel_size: user_settings.intensity.into(),
             gpu_index: user_settings.gpu_index,
+            stratum_url: Some(user_settings.stratum_url.clone()),
+            stratum_worker_name: Some(user_settings.stratum_worker_name.clone()),
+            stratum_password: Some(user_settings.stratum_password.clone()),
         };
         MinerApp {
             user_settings,
@@ -161,6 +175,18 @@ impl epi::App for MinerApp {
                         &mut self.user_settings.rpc_poll_interval,
                         1..=10,
                     ));
+                    ui.end_row();
+
+                    ui.label("Stratum URL (host:port): ");
+                    ui.text_edit_singleline(&mut self.user_settings.stratum_url);
+                    ui.end_row();
+
+                    ui.label("Stratum Worker Name: ");
+                    ui.text_edit_singleline(&mut self.user_settings.stratum_worker_name);
+                    ui.end_row();
+
+                    ui.label("Stratum Password: ");
+                    ui.add(TextEdit::singleline(&mut self.user_settings.stratum_password).password(true));
                     ui.end_row();
 
                     ui.label("GPU: ");
@@ -289,6 +315,22 @@ impl MinerApp {
             node_settings.bitcoind_password = user_settings.bitcoind_password;
             node_settings.rpc_poll_interval = user_settings.rpc_poll_interval;
             node_settings.miner_addr = user_settings.mine_to_address;
+            drop(node_settings);
+
+            let mut stratum_settings = server.stratum_settings().await;
+            stratum_settings.stratum_url = if user_settings.stratum_url.trim().is_empty() {
+                None
+            } else {
+                Some(user_settings.stratum_url)
+            };
+            stratum_settings.stratum_worker_name = if user_settings.stratum_worker_name.trim().is_empty() {
+                None
+            } else {
+                Some(user_settings.stratum_worker_name)
+            };
+            stratum_settings.stratum_password = user_settings.stratum_password;
+            drop(stratum_settings);
+
             let mut miner = server.miner();
             miner.set_intensity(user_settings.intensity);
             let result = miner.update_gpu_index(user_settings.gpu_index);

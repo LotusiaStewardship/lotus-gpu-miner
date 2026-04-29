@@ -22,12 +22,18 @@ use miner::{MiningSettings, Work};
 use rand::{Rng, SeedableRng};
 use reqwest::{RequestBuilder, StatusCode};
 use serde::Deserialize;
-use tokio::sync::{Mutex, MutexGuard};
+use serde_json::Value;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
+    sync::{Mutex, MutexGuard},
+};
 
 pub struct Server {
     client: reqwest::Client,
     miner: std::sync::Mutex<Miner>,
     node_settings: Mutex<NodeSettings>,
+    stratum_settings: Mutex<StratumSettings>,
     block_state: Mutex<BlockState>,
     rng: Mutex<rand::rngs::StdRng>,
     metrics_timestamp: Mutex<SystemTime>,
@@ -42,6 +48,14 @@ pub struct NodeSettings {
     pub bitcoind_password: String,
     pub rpc_poll_interval: u64,
     pub miner_addr: String,
+}
+
+pub struct StratumSettings {
+    pub stratum_url: Option<String>,
+    pub stratum_worker_name: Option<String>,
+    pub stratum_password: String,
+    pub stratum_extranonce2_size: usize,
+    pub stratum_difficulty: f64,
 }
 
 pub struct Log {
@@ -73,6 +87,14 @@ struct BlockState {
     current_block: Option<Block>,
     next_block: Option<Block>,
     extra_nonce: u64,
+    stratum_job: Option<StratumJob>,
+}
+
+#[derive(Debug, Clone)]
+struct StratumJob {
+    job_id: String,
+    ntime_hex_6b: String,
+    extranonce2: String,
 }
 
 pub type ServerRef = Arc<Server>;
@@ -88,6 +110,18 @@ impl Server {
             gpu_indices: vec![config.gpu_index as usize],
         };
         let miner = Miner::setup(mining_settings.clone()).unwrap();
+
+        let stratum_url = config
+            .stratum_url
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let stratum_worker_name = config
+            .stratum_worker_name
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         Server {
             miner: std::sync::Mutex::new(miner),
             client: reqwest::Client::new(),
@@ -98,11 +132,21 @@ impl Server {
                 rpc_poll_interval: config.rpc_poll_interval.try_into().unwrap(),
                 miner_addr: config.mine_to_address.clone(),
             }),
+            stratum_settings: Mutex::new(StratumSettings {
+                stratum_url,
+                stratum_worker_name,
+                stratum_password: config
+                    .stratum_password
+                    .unwrap_or_else(|| "x".to_string()),
+                stratum_extranonce2_size: 4,
+                stratum_difficulty: 1.0,
+            }),
             block_state: Mutex::new(BlockState {
                 current_work: Work::default(),
                 current_block: None,
                 next_block: None,
                 extra_nonce: 0,
+                stratum_job: None,
             }),
             rng: Mutex::new(rand::rngs::StdRng::from_entropy()),
             metrics_timestamp: Mutex::new(SystemTime::now()),
@@ -113,38 +157,28 @@ impl Server {
     }
 
     pub async fn run(self: ServerRef) -> Result<(), Box<dyn std::error::Error>> {
-        let t1 = tokio::spawn({
-            let server = Arc::clone(&self);
-            async move {
-                let log = server.log();
-                loop {
-                    if let Err(err) = update_next_block(&server).await {
-                        log.error(format!("update_next_block error: {:?}", err));
-                    }
-                    let rpc_poll_interval = server.node_settings.lock().await.rpc_poll_interval;
-                    tokio::time::sleep(Duration::from_secs(rpc_poll_interval)).await;
-                }
-            }
-        });
-        let t2 = tokio::spawn({
-            let server = Arc::clone(&self);
-            async move {
-                let log = server.log();
-                loop {
-                    if let Err(err) = mine_some_nonces(Arc::clone(&server)).await {
-                        log.error(format!("mine_some_nonces error: {:?}", err));
-                    }
-                    tokio::time::sleep(Duration::from_micros(3)).await;
-                }
-            }
-        });
-        t1.await?;
-        t2.await?;
-        Ok(())
+        let stratum_enabled = self
+            .stratum_settings
+            .lock()
+            .await
+            .stratum_url
+            .as_ref()
+            .is_some();
+        if stratum_enabled {
+            self.log().info("Starting in STRATUM mode");
+            run_stratum(self).await
+        } else {
+            self.log().info("Starting in SOLO JSON-RPC mode");
+            run_solo(self).await
+        }
     }
 
     pub async fn node_settings<'a>(&'a self) -> MutexGuard<'a, NodeSettings> {
         self.node_settings.lock().await
+    }
+
+    pub async fn stratum_settings<'a>(&'a self) -> MutexGuard<'a, StratumSettings> {
+        self.stratum_settings.lock().await
     }
 
     pub fn miner<'a>(&'a self) -> std::sync::MutexGuard<'a, Miner> {
@@ -153,6 +187,388 @@ impl Server {
 
     pub fn log(&self) -> &Log {
         &self.log
+    }
+
+    async fn stratum_worker_full_name(&self) -> Result<String> {
+        let miner_addr = self.node_settings.lock().await.miner_addr.clone();
+        if miner_addr.trim().is_empty() {
+            return Err(eyre::eyre!(
+                "mine_to_address must be set for stratum mode"
+            ));
+        }
+        let worker_name = self.stratum_settings.lock().await.stratum_worker_name.clone();
+        let full = match worker_name {
+            Some(worker) if !worker.is_empty() => format!("{}.{}", miner_addr, worker),
+            _ => miner_addr,
+        };
+        Ok(full)
+    }
+}
+
+async fn run_solo(server: ServerRef) -> Result<(), Box<dyn std::error::Error>> {
+    let t1 = tokio::spawn({
+        let server = Arc::clone(&server);
+        async move {
+            let log = server.log();
+            loop {
+                if let Err(err) = update_next_block(&server).await {
+                    log.error(format!("update_next_block error: {:?}", err));
+                }
+                let rpc_poll_interval = server.node_settings.lock().await.rpc_poll_interval;
+                tokio::time::sleep(Duration::from_secs(rpc_poll_interval)).await;
+            }
+        }
+    });
+    let t2 = tokio::spawn({
+        let server = Arc::clone(&server);
+        async move {
+            let log = server.log();
+            loop {
+                if let Err(err) = mine_some_nonces(Arc::clone(&server)).await {
+                    log.error(format!("mine_some_nonces error: {:?}", err));
+                }
+            }
+        }
+    });
+    t1.await?;
+    t2.await?;
+    Ok(())
+}
+
+async fn run_stratum(server: ServerRef) -> Result<(), Box<dyn std::error::Error>> {
+    let mut backoff_secs: u64 = 1;
+    loop {
+        let stratum_url = server
+            .stratum_settings
+            .lock()
+            .await
+            .stratum_url
+            .clone()
+            .ok_or_else(|| eyre::eyre!("stratum_url is not set"))?;
+        server
+            .log()
+            .info(format!("Connecting to stratum {}", stratum_url));
+
+        match run_stratum_session(Arc::clone(&server), &stratum_url).await {
+            Ok(()) => {
+                server.log().warn("Stratum session ended, reconnecting");
+            }
+            Err(err) => {
+                server
+                    .log()
+                    .error(format!("Stratum session error: {}", err));
+            }
+        }
+
+        server
+            .log()
+            .warn(format!("Retrying stratum in {}s", backoff_secs));
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(60);
+    }
+}
+
+async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()> {
+    let stream = TcpStream::connect(stratum_url).await?;
+    let (reader_half, mut writer_half) = stream.into_split();
+    let mut reader = BufReader::new(reader_half);
+    let mut line = String::new();
+    let mut req_id: u64 = 1;
+
+    let worker_name = server.stratum_worker_full_name().await?;
+    let stratum_password = server.stratum_settings.lock().await.stratum_password.clone();
+
+    let subscribe_id = req_id;
+    req_id += 1;
+    let subscribe = serde_json::json!({
+        "id": subscribe_id,
+        "method": "mining.subscribe",
+        "params": []
+    });
+    writer_half
+        .write_all(format!("{}\n", subscribe).as_bytes())
+        .await?;
+    server.log().info("Sent mining.subscribe");
+
+    let authorize_id = req_id;
+    req_id += 1;
+    let authorize = serde_json::json!({
+        "id": authorize_id,
+        "method": "mining.authorize",
+        "params": [worker_name, stratum_password]
+    });
+    writer_half
+        .write_all(format!("{}\n", authorize).as_bytes())
+        .await?;
+    server.log().info("Sent mining.authorize");
+    server.log().info("Optional methods (extranonce.subscribe / suggest_difficulty / set_extranonce) are scaffolded but disabled by default");
+
+    loop {
+        line.clear();
+        tokio::select! {
+            read = reader.read_line(&mut line) => {
+                let n = read?;
+                if n == 0 {
+                    return Err(eyre::eyre!("stratum socket closed"));
+                }
+                handle_stratum_line(&server, line.trim_end(), subscribe_id, authorize_id).await?;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                if let Some((job_id, extranonce2, ntime, nonce_hex)) = mine_some_nonces_stratum(Arc::clone(&server)).await? {
+                    let submit_id = req_id;
+                    req_id += 1;
+                    let submit = serde_json::json!({
+                        "id": submit_id,
+                        "method": "mining.submit",
+                        "params": [
+                            server.stratum_worker_full_name().await?,
+                            job_id,
+                            extranonce2,
+                            ntime,
+                            nonce_hex,
+                        ]
+                    });
+                    writer_half
+                        .write_all(format!("{}\n", submit).as_bytes())
+                        .await?;
+                    server.log().info(format!("Sent mining.submit id={}", submit_id));
+                }
+            }
+        }
+    }
+}
+
+async fn handle_stratum_line(
+    server: &Server,
+    line: &str,
+    subscribe_id: u64,
+    authorize_id: u64,
+) -> Result<()> {
+    let v: Value = serde_json::from_str(line)?;
+
+    if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
+        match method {
+            "mining.set_difficulty" => {
+                let diff = v
+                    .get("params")
+                    .and_then(|p| p.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|d| d.as_f64())
+                    .unwrap_or(1.0)
+                    .max(0.0000001);
+                server.stratum_settings.lock().await.stratum_difficulty = diff;
+                server.log().info(format!("set_difficulty={}", diff));
+            }
+            "mining.notify" => {
+                let params = v
+                    .get("params")
+                    .and_then(|p| p.as_array())
+                    .ok_or_else(|| eyre::eyre!("invalid mining.notify params"))?;
+                let job_id = params.get(0).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let ntime_hex_6b = normalize_hex_len(
+                    params.get(7).and_then(|v| v.as_str()).unwrap_or("000000000000"),
+                    12,
+                );
+                let clean_jobs = params.get(8).and_then(|v| v.as_bool()).unwrap_or(false);
+
+                let mut header = [0u8; 160];
+                if let Some(prevhash) = params.get(1).and_then(|v| v.as_str()) {
+                    let prev = hex::decode(prevhash).unwrap_or_default();
+                    let copy_len = prev.len().min(32);
+                    header[..copy_len].copy_from_slice(&prev[..copy_len]);
+                }
+                if let Some(version) = params.get(5).and_then(|v| v.as_str()) {
+                    let version = hex::decode(version).unwrap_or_default();
+                    let copy_len = version.len().min(4);
+                    header[32..32 + copy_len].copy_from_slice(&version[..copy_len]);
+                }
+                if let Some(nbits) = params.get(6).and_then(|v| v.as_str()) {
+                    let nbits = hex::decode(nbits).unwrap_or_default();
+                    let copy_len = nbits.len().min(4);
+                    header[36..36 + copy_len].copy_from_slice(&nbits[..copy_len]);
+                }
+                if let Ok(ntime) = hex::decode(&ntime_hex_6b) {
+                    let copy_len = ntime.len().min(6);
+                    header[40..40 + copy_len].copy_from_slice(&ntime[..copy_len]);
+                }
+
+                let difficulty = server.stratum_settings.lock().await.stratum_difficulty;
+                let target = difficulty_to_target(difficulty);
+                let mut block_state = server.block_state.lock().await;
+                block_state.current_work = Work::from_header(header, target);
+                if clean_jobs {
+                    block_state.current_work.nonce_idx = 0;
+                }
+                let extranonce2_size = server.stratum_settings.lock().await.stratum_extranonce2_size;
+                let extranonce2 = random_extranonce2(extranonce2_size);
+                block_state.stratum_job = Some(StratumJob {
+                    job_id: job_id.clone(),
+                    ntime_hex_6b,
+                    extranonce2,
+                });
+                drop(block_state);
+                server.log().info(format!(
+                    "Work update: mining.notify job_id={} clean_jobs={} difficulty={}",
+                    job_id,
+                    clean_jobs,
+                    difficulty
+                ));
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    let id = v.get("id").and_then(|id| id.as_u64()).unwrap_or(0);
+    let err = v.get("error");
+    if id == subscribe_id {
+        if err.is_some() && !err.unwrap().is_null() {
+            server
+                .log()
+                .error(format!("mining.subscribe failed: {}", err.unwrap()));
+        } else {
+            let extranonce2_size = v
+                .get("result")
+                .and_then(|r| r.as_array())
+                .and_then(|a| a.get(2))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(4) as usize;
+            server.stratum_settings.lock().await.stratum_extranonce2_size = extranonce2_size;
+            server
+                .log()
+                .info(format!("mining.subscribe OK extranonce2_size={}", extranonce2_size));
+        }
+    } else if id == authorize_id {
+        if err.is_some() && !err.unwrap().is_null() {
+            server
+                .log()
+                .error(format!("mining.authorize failed: {}", err.unwrap()));
+        } else {
+            let ok = v.get("result").and_then(|r| r.as_bool()).unwrap_or(false);
+            if ok {
+                server.log().info("mining.authorize OK");
+            } else {
+                server.log().error("mining.authorize rejected by server");
+            }
+        }
+    } else if err.is_some() && !err.unwrap().is_null() {
+        server
+            .log()
+            .warn(format!("Stratum response id={} error={}", id, err.unwrap()));
+    } else if let Some(result_bool) = v.get("result").and_then(|r| r.as_bool()) {
+        if result_bool {
+            server.log().info(format!("Share accepted id={}", id));
+        } else {
+            server.log().warn(format!("Share rejected id={} (result=false)", id));
+        }
+    }
+
+    Ok(())
+}
+
+fn difficulty_to_target(difficulty: f64) -> [u8; 32] {
+    // Conservative fallback target mapper for Stratum mode in this phase.
+    // A full compact-target conversion can replace this when server-side typed
+    // template integration is complete.
+    if difficulty <= 0.0 {
+        return [0xff; 32];
+    }
+    let scale = (255.0 / difficulty.sqrt()).clamp(1.0, 255.0) as u8;
+    [scale; 32]
+}
+
+fn random_extranonce2(extranonce2_size: usize) -> String {
+    let bytes = extranonce2_size.max(1).min(16);
+    let mut out = String::new();
+    for _ in 0..bytes {
+        let b: u8 = rand::thread_rng().gen();
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+fn normalize_hex_len(value: &str, len: usize) -> String {
+    let mut s = value.trim().to_ascii_lowercase();
+    if s.len() > len {
+        s.truncate(len);
+    }
+    while s.len() < len {
+        s.push('0');
+    }
+    s
+}
+
+async fn mine_some_nonces_stratum(
+    server: ServerRef,
+) -> Result<Option<(String, String, String, String)>> {
+    let log = server.log();
+    let block_state = server.block_state.lock().await;
+    let Some(job) = block_state.stratum_job.clone() else {
+        return Ok(None);
+    };
+
+    let mut work = block_state.current_work;
+    let big_nonce = server.rng.lock().await.gen();
+    work.set_big_nonce(big_nonce);
+    drop(block_state);
+
+    let (nonce, num_nonces_per_search) = tokio::task::spawn_blocking({
+        let server = Arc::clone(&server);
+        move || {
+            let mut miner = server.miner.lock().unwrap();
+            if !miner.has_nonces_left(&work) {
+                return Ok((None, 0));
+            }
+            miner
+                .find_nonce(&work, server.log())
+                .map(|nonce| (nonce, miner.num_nonces_per_search()))
+        }
+    })
+    .await
+    .unwrap()?;
+
+    let mut block_state = server.block_state.lock().await;
+    block_state.current_work.nonce_idx += 1;
+    server
+        .metrics_nonces
+        .fetch_add(num_nonces_per_search, Ordering::AcqRel);
+    update_hashrate(server.as_ref(), log).await;
+
+    if let Some(nonce) = nonce {
+        let nonce_hex = format!("{:016x}", nonce);
+        log.info(format!(
+            "Candidate share job_id={} extranonce2={} nonce={}",
+            job.job_id, job.extranonce2, nonce_hex
+        ));
+        return Ok(Some((
+            job.job_id,
+            job.extranonce2,
+            job.ntime_hex_6b,
+            nonce_hex,
+        )));
+    }
+
+    Ok(None)
+}
+
+async fn update_hashrate(server: &Server, log: &Log) {
+    let mut timestamp = server.metrics_timestamp.lock().await;
+    let elapsed = match SystemTime::now().duration_since(*timestamp) {
+        Ok(elapsed) => elapsed,
+        Err(err) => {
+            log.bug(format!(
+                "BUG: Elapsed time error: {}. Contact the developers.",
+                err
+            ));
+            return;
+        }
+    };
+    if elapsed > server.report_hashrate_interval {
+        let num_nonces = server.metrics_nonces.load(Ordering::Acquire);
+        let hashrate = num_nonces as f64 / elapsed.as_secs_f64();
+        log.report_hashrate(hashrate);
+        server.metrics_nonces.store(0, Ordering::Release);
+        *timestamp = SystemTime::now();
     }
 }
 
@@ -239,7 +655,7 @@ async fn mine_some_nonces(server: ServerRef) -> Result<()> {
     let mut work = block_state.current_work;
     let big_nonce = server.rng.lock().await.gen();
     work.set_big_nonce(big_nonce);
-    drop(block_state); // release lock
+    drop(block_state);
     let (nonce, num_nonces_per_search) = tokio::task::spawn_blocking({
         let server = Arc::clone(&server);
         move || {
@@ -279,24 +695,7 @@ async fn mine_some_nonces(server: ServerRef) -> Result<()> {
     server
         .metrics_nonces
         .fetch_add(num_nonces_per_search, Ordering::AcqRel);
-    let mut timestamp = server.metrics_timestamp.lock().await;
-    let elapsed = match SystemTime::now().duration_since(*timestamp) {
-        Ok(elapsed) => elapsed,
-        Err(err) => {
-            log.bug(format!(
-                "BUG: Elapsed time error: {}. Contact the developers.",
-                err
-            ));
-            return Ok(());
-        }
-    };
-    if elapsed > server.report_hashrate_interval {
-        let num_nonces = server.metrics_nonces.load(Ordering::Acquire);
-        let hashrate = num_nonces as f64 / elapsed.as_secs_f64();
-        log.report_hashrate(hashrate);
-        server.metrics_nonces.store(0, Ordering::Release);
-        *timestamp = SystemTime::now();
-    }
+    update_hashrate(server.as_ref(), log).await;
     Ok(())
 }
 

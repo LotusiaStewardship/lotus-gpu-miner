@@ -18,8 +18,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use bitcoinsuite_bitcoind_stratum::{build_stratum_header, difficulty_to_target};
 use bitcoinsuite_core::{
-    lotus_txid, BitcoinCode, Bytes, Hashed, LotusAddress, LotusHeader, Sha256d, Tx,
+    LotusAddress,
 };
 use block::{create_block, Block, GetRawUnsolvedBlockResponse};
 use miner::{MiningSettings, Work};
@@ -142,7 +143,6 @@ struct ParsedNotify {
     nbits: String,
     ntime_hex_6b: String,
     clean_jobs: bool,
-    template_header: [u8; 160],
 }
 
 fn is_valid_lotus_identity(s: &str) -> bool {
@@ -150,8 +150,8 @@ fn is_valid_lotus_identity(s: &str) -> bool {
 }
 
 fn parse_notify_params(params: &[Value]) -> Result<ParsedNotify> {
-    if params.len() != 10 {
-        return Err(eyre::eyre!("mining.notify params must have length 10"));
+    if params.len() != 9 {
+        return Err(eyre::eyre!("mining.notify params must have length 9"));
     }
     let job_id = params[0]
         .as_str()
@@ -194,17 +194,6 @@ fn parse_notify_params(params: &[Value]) -> Result<ParsedNotify> {
     let clean_jobs = params[8]
         .as_bool()
         .ok_or_else(|| eyre::eyre!("invalid clean_jobs in mining.notify"))?;
-    let template_header_hex = params[9]
-        .as_str()
-        .ok_or_else(|| eyre::eyre!("invalid template_header in mining.notify"))?;
-    let template_header_vec = hex::decode(template_header_hex)?;
-    if template_header_vec.len() != 160 {
-        return Err(eyre::eyre!(
-            "invalid template_header length in mining.notify"
-        ));
-    }
-    let mut template_header = [0u8; 160];
-    template_header.copy_from_slice(&template_header_vec);
 
     Ok(ParsedNotify {
         job_id,
@@ -216,31 +205,7 @@ fn parse_notify_params(params: &[Value]) -> Result<ParsedNotify> {
         nbits,
         ntime_hex_6b,
         clean_jobs,
-        template_header,
     })
-}
-
-fn difficulty_target_le(difficulty: f64) -> Result<[u8; 32]> {
-    if difficulty <= 0.0 || !difficulty.is_finite() {
-        return Err(eyre::eyre!("invalid stratum difficulty"));
-    }
-    let diff1 = primitive_types::U256::from_big_endian(&hex::decode(
-        "00000000ffff0000000000000000000000000000000000000000000000000000",
-    )?);
-    let scale = 100_000_000u128;
-    let scaled = (difficulty * scale as f64).round() as u128;
-    if scaled == 0 {
-        return Err(eyre::eyre!("invalid stratum difficulty"));
-    }
-    let mut target =
-        (diff1 * primitive_types::U256::from(scale)) / primitive_types::U256::from(scaled);
-    if target.is_zero() {
-        target = primitive_types::U256::one();
-    }
-    let mut be = [0u8; 32];
-    target.to_big_endian(&mut be);
-    be.reverse();
-    Ok(be)
 }
 
 fn format_extranonce2(counter: u64, extranonce2_size: usize) -> Result<String> {
@@ -253,72 +218,6 @@ fn format_extranonce2(counter: u64, extranonce2_size: usize) -> Result<String> {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&counter.to_be_bytes());
     Ok(hex::encode(&bytes[8 - extranonce2_size..]))
-}
-
-fn build_stratum_header(
-    notify: &ParsedNotify,
-    extranonce1: &str,
-    extranonce2: &str,
-    nonce_hex_8b: &str,
-) -> Result<[u8; 160]> {
-    let coinbase_hex = format!(
-        "{}{}{}{}",
-        notify.coinbase1, extranonce1, extranonce2, notify.coinbase2
-    );
-    let coinbase_bytes = hex::decode(&coinbase_hex)?;
-    // Deserialize to Tx to compute txid and lotus_txid
-    let mut coinbase_buf = Bytes::from_slice(&coinbase_bytes);
-    let coinbase_tx = Tx::deser(&mut coinbase_buf)?;
-    let txid = coinbase_tx.hash();
-    let lotus_txid_val = lotus_txid(coinbase_tx.unhashed_tx());
-    // Lotus merkle leaf: SHA256d(txid || lotus_txid)
-    let mut merkle_leaf_raw = Vec::with_capacity(64);
-    merkle_leaf_raw.extend_from_slice(txid.as_ref());
-    merkle_leaf_raw.extend_from_slice(lotus_txid_val.as_ref());
-    let merkle_leaf = Sha256d::digest(Bytes::from_slice(&merkle_leaf_raw));
-    let mut merkle = merkle_leaf.as_ref().to_vec();
-    for branch_hex in &notify.merkle_branches {
-        let branch = hex::decode(branch_hex)?;
-        let mut concat = Vec::with_capacity(64);
-        concat.extend_from_slice(&merkle);
-        concat.extend_from_slice(&branch);
-        merkle = Sha256d::digest(concat.into()).as_ref().to_vec();
-    }
-
-    let mut raw_template_header = Bytes::from_slice(&notify.template_header);
-    let mut header = LotusHeader::deser(&mut raw_template_header)?;
-
-    let nbits_bytes: [u8; 4] = hex::decode(&notify.nbits)?
-        .as_slice()
-        .try_into()
-        .map_err(|_| eyre::eyre!("invalid nbits length"))?;
-    let ntime_bytes: [u8; 6] = hex::decode(&notify.ntime_hex_6b)?
-        .as_slice()
-        .try_into()
-        .map_err(|_| eyre::eyre!("invalid ntime length"))?;
-    let nonce_bytes: [u8; 8] = hex::decode(nonce_hex_8b)?
-        .as_slice()
-        .try_into()
-        .map_err(|_| eyre::eyre!("invalid nonce length"))?;
-    let merkle_bytes: [u8; 32] = merkle
-        .as_slice()
-        .try_into()
-        .map_err(|_| eyre::eyre!("invalid merkle length"))?;
-
-    let mut ntime_le8 = [0u8; 8];
-    ntime_le8[..6].copy_from_slice(&ntime_bytes);
-
-    header.bits = u32::from_le_bytes(nbits_bytes);
-    header.timestamp = i64::from_le_bytes(ntime_le8);
-    header.nonce = u64::from_le_bytes(nonce_bytes);
-    header.merkle_root = Sha256d::new(merkle_bytes);
-
-    let header_vec = header.ser().as_ref().to_vec();
-    let header_arr: [u8; 160] = header_vec
-        .as_slice()
-        .try_into()
-        .map_err(|_| eyre::eyre!("invalid serialized Lotus header length"))?;
-    Ok(header_arr)
 }
 
 pub type ServerRef = Arc<Server>;
@@ -679,13 +578,32 @@ async fn handle_stratum_line(
                 let parsed = parse_notify_params(params)?;
                 let settings = server.stratum_settings.lock().await;
                 let extranonce1 = settings.stratum_extranonce1.clone();
-                let share_target_le = difficulty_target_le(settings.stratum_difficulty)?;
+                // difficulty_to_target returns big-endian, but Work expects LE
+                let target_be = difficulty_to_target(settings.stratum_difficulty)?;
+                let mut share_target_le = [0u8; 32];
+                share_target_le.copy_from_slice(&target_be);
+                share_target_le.reverse(); // Convert BE to LE for Work
                 let extranonce2_size = settings.stratum_extranonce2_size;
                 drop(settings);
 
                 let extranonce2 = format_extranonce2(0, extranonce2_size)?;
-                let header_160 =
-                    build_stratum_header(&parsed, &extranonce1, &extranonce2, "0000000000000000")?;
+
+                let header_vec = build_stratum_header(
+                    &parsed.coinbase1,
+                    &extranonce1,
+                    &extranonce2,
+                    &parsed.coinbase2,
+                    &parsed.merkle_branches,
+                    &parsed.prevhash,
+                    &parsed.version,
+                    &parsed.nbits,
+                    &parsed.ntime_hex_6b,
+                    "0000000000000000",
+                )?;
+                let header_160: [u8; 160] = header_vec
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| eyre::eyre!("invalid header length"))?;
 
                 let mut block_state = server.block_state.lock().await;
                 block_state.current_work = Work::from_header(header_160, share_target_le);
@@ -849,8 +767,22 @@ async fn mine_some_nonces_stratum(
     let extranonce1 = settings.stratum_extranonce1.clone();
     drop(settings);
 
-    let header_160 =
-        build_stratum_header(&job.notify, &extranonce1, &extranonce2, "0000000000000000")?;
+    let header_vec = build_stratum_header(
+        &job.notify.coinbase1,
+        &extranonce1,
+        &extranonce2,
+        &job.notify.coinbase2,
+        &job.notify.merkle_branches,
+        &job.notify.prevhash,
+        &job.notify.version,
+        &job.notify.nbits,
+        &job.notify.ntime_hex_6b,
+        "0000000000000000",
+    )?;
+    let header_160: [u8; 160] = header_vec
+        .as_slice()
+        .try_into()
+        .map_err(|_| eyre::eyre!("invalid header length"))?;
     block_state.current_work = Work::from_header(header_160, job.share_target_le);
     let mut work = block_state.current_work;
     let big_nonce = server.rng.lock().await.gen();

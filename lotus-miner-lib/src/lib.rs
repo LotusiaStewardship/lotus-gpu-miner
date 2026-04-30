@@ -18,7 +18,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use bitcoinsuite_core::LotusAddress;
+use bitcoinsuite_core::{Hashed, LotusAddress, Sha256d};
 use block::{create_block, Block, GetRawUnsolvedBlockResponse};
 use miner::{MiningSettings, Work};
 use rand::{Rng, SeedableRng};
@@ -97,7 +97,9 @@ struct BlockState {
 struct StratumJob {
     job_id: String,
     ntime_hex_6b: String,
-    extranonce2: String,
+    notify: ParsedNotify,
+    share_target_le: [u8; 32],
+    extranonce2_counter: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,11 +129,14 @@ struct StratumHandshakeState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedPrecomputedWork {
+struct ParsedNotify {
     job_id: String,
-    header_160: [u8; 160],
-    share_target_le: [u8; 32],
-    extranonce2: String,
+    prevhash: String,
+    coinbase1: String,
+    coinbase2: String,
+    merkle_branches: Vec<String>,
+    version: String,
+    nbits: String,
     ntime_hex_6b: String,
     clean_jobs: bool,
 }
@@ -140,74 +145,126 @@ fn is_valid_lotus_identity(s: &str) -> bool {
     s.parse::<LotusAddress>().is_ok()
 }
 
-fn parse_precomputed_work_params(params: &[Value]) -> Result<ParsedPrecomputedWork> {
-    if params.len() != 6 {
-        return Err(eyre::eyre!(
-            "lotus.precomputed_work params must have length 6"
-        ));
+fn parse_notify_params(params: &[Value]) -> Result<ParsedNotify> {
+    if params.len() != 9 {
+        return Err(eyre::eyre!("mining.notify params must have length 9"));
     }
-
     let job_id = params[0]
         .as_str()
-        .ok_or_else(|| eyre::eyre!("invalid job_id in lotus.precomputed_work"))?
+        .ok_or_else(|| eyre::eyre!("invalid job_id in mining.notify"))?
         .to_string();
-    if job_id.trim().is_empty() {
-        return Err(eyre::eyre!("empty job_id in lotus.precomputed_work"));
-    }
-
-    let header_160_hex = params[1]
+    let prevhash = params[1]
         .as_str()
-        .ok_or_else(|| eyre::eyre!("invalid header_160_hex in lotus.precomputed_work"))?;
-    if header_160_hex.len() != 320 || !header_160_hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(eyre::eyre!(
-            "invalid header_160_hex in lotus.precomputed_work"
-        ));
-    }
-    let header_vec = hex::decode(header_160_hex)?;
-    let mut header_160 = [0u8; 160];
-    header_160.copy_from_slice(&header_vec);
-
-    let share_target_hex = params[2]
-        .as_str()
-        .ok_or_else(|| eyre::eyre!("invalid share_target_hex in lotus.precomputed_work"))?;
-    if share_target_hex.len() != 64 || !share_target_hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(eyre::eyre!(
-            "invalid share_target_hex in lotus.precomputed_work"
-        ));
-    }
-    let target_vec = hex::decode(share_target_hex)?;
-    let mut share_target_le = [0u8; 32];
-    share_target_le.copy_from_slice(&target_vec);
-    share_target_le.reverse();
-
-    let extranonce2 = params[3]
-        .as_str()
-        .ok_or_else(|| eyre::eyre!("invalid extranonce2 in lotus.precomputed_work"))?
+        .ok_or_else(|| eyre::eyre!("invalid prevhash in mining.notify"))?
         .to_string();
-    if extranonce2.len() != 8 || !extranonce2.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(eyre::eyre!("invalid extranonce2 in lotus.precomputed_work"));
-    }
-
-    let ntime_hex_6b = params[4]
+    let coinbase1 = params[2]
         .as_str()
-        .ok_or_else(|| eyre::eyre!("invalid ntime in lotus.precomputed_work"))?
+        .ok_or_else(|| eyre::eyre!("invalid coinbase1 in mining.notify"))?
         .to_string();
-    if ntime_hex_6b.len() != 12 || !ntime_hex_6b.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(eyre::eyre!("invalid ntime in lotus.precomputed_work"));
-    }
-
-    let clean_jobs = params[5]
+    let coinbase2 = params[3]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("invalid coinbase2 in mining.notify"))?
+        .to_string();
+    let merkle_branches = params[4]
+        .as_array()
+        .ok_or_else(|| eyre::eyre!("invalid merkle branches in mining.notify"))?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .ok_or_else(|| eyre::eyre!("invalid merkle branch in mining.notify"))
+                .map(|s| s.to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let version = params[5]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("invalid version in mining.notify"))?
+        .to_string();
+    let nbits = params[6]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("invalid nbits in mining.notify"))?
+        .to_string();
+    let ntime_hex_6b = params[7]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("invalid ntime in mining.notify"))?
+        .to_string();
+    let clean_jobs = params[8]
         .as_bool()
-        .ok_or_else(|| eyre::eyre!("invalid clean_jobs in lotus.precomputed_work"))?;
+        .ok_or_else(|| eyre::eyre!("invalid clean_jobs in mining.notify"))?;
 
-    Ok(ParsedPrecomputedWork {
+    Ok(ParsedNotify {
         job_id,
-        header_160,
-        share_target_le,
-        extranonce2,
+        prevhash,
+        coinbase1,
+        coinbase2,
+        merkle_branches,
+        version,
+        nbits,
         ntime_hex_6b,
         clean_jobs,
     })
+}
+
+fn difficulty_target_le(difficulty: f64) -> Result<[u8; 32]> {
+    if difficulty <= 0.0 || !difficulty.is_finite() {
+        return Err(eyre::eyre!("invalid stratum difficulty"));
+    }
+    let diff1 = primitive_types::U256::from_big_endian(
+        &hex::decode("00000000ffff0000000000000000000000000000000000000000000000000000")?,
+    );
+    let scale = 100_000_000u128;
+    let scaled = (difficulty * scale as f64).round() as u128;
+    if scaled == 0 {
+        return Err(eyre::eyre!("invalid stratum difficulty"));
+    }
+    let mut target = (diff1 * primitive_types::U256::from(scale)) / primitive_types::U256::from(scaled);
+    if target.is_zero() {
+        target = primitive_types::U256::one();
+    }
+    let mut be = [0u8; 32];
+    target.to_big_endian(&mut be);
+    be.reverse();
+    Ok(be)
+}
+
+fn build_stratum_header(
+    notify: &ParsedNotify,
+    extranonce1: &str,
+    extranonce2: &str,
+    nonce_hex_8b: &str,
+) -> Result<[u8; 160]> {
+    let coinbase = hex::decode(format!(
+        "{}{}{}{}",
+        notify.coinbase1, extranonce1, extranonce2, notify.coinbase2
+    ))?;
+    let mut merkle = Sha256d::digest(coinbase.into()).as_ref().to_vec();
+    for branch_hex in &notify.merkle_branches {
+        let branch = hex::decode(branch_hex)?;
+        let mut concat = Vec::with_capacity(64);
+        concat.extend_from_slice(&merkle);
+        concat.extend_from_slice(&branch);
+        merkle = Sha256d::digest(concat.into()).as_ref().to_vec();
+    }
+
+    let merkle_hex = hex::encode(merkle);
+    let mut header = [0u8; 160];
+    let mut cursor = 0;
+    for part in [
+        notify.version.as_str(),
+        notify.prevhash.as_str(),
+        merkle_hex.as_str(),
+        notify.ntime_hex_6b.as_str(),
+        notify.nbits.as_str(),
+        nonce_hex_8b,
+    ] {
+        let bytes = hex::decode(part)?;
+        let end = cursor + bytes.len();
+        header[cursor..end].copy_from_slice(&bytes);
+        cursor = end;
+    }
+    if cursor != 160 {
+        return Err(eyre::eyre!("invalid mining.notify header composition"));
+    }
+    Ok(header)
 }
 
 pub type ServerRef = Arc<Server>;
@@ -419,7 +476,7 @@ async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()>
         .write_all(format!("{}\n", subscribe).as_bytes())
         .await?;
     server.log().info("Sent mining.subscribe");
-    server.log().info("Optional methods (extranonce.subscribe / suggest_difficulty / set_extranonce) are scaffolded but disabled by default");
+    server.log().info("Subscribed; awaiting mining.notify work");
 
     let mut authorize_sent = false;
     let mut last_outbound = std::time::Instant::now();
@@ -529,39 +586,70 @@ async fn handle_stratum_line(
                 server.stratum_settings.lock().await.stratum_difficulty = diff;
                 server.log().info(format!("set_difficulty={}", diff));
             }
-            "lotus.precomputed_work" => {
+            "mining.set_extranonce" => {
+                let params = v
+                    .get("params")
+                    .and_then(|p| p.as_array())
+                    .ok_or_else(|| eyre::eyre!("invalid mining.set_extranonce params"))?;
+                if params.len() != 2 {
+                    return Err(eyre::eyre!("mining.set_extranonce params must have length 2"));
+                }
+                let extranonce1 = params[0]
+                    .as_str()
+                    .ok_or_else(|| eyre::eyre!("invalid extranonce1 in mining.set_extranonce"))?
+                    .to_string();
+                let extranonce2_size = params[1]
+                    .as_u64()
+                    .ok_or_else(|| eyre::eyre!("invalid extranonce2_size in mining.set_extranonce"))?
+                    as usize;
+                let mut settings = server.stratum_settings.lock().await;
+                settings.stratum_extranonce1 = extranonce1;
+                settings.stratum_extranonce2_size = extranonce2_size;
+                server.log().info(format!("set_extranonce extranonce2_size={}", extranonce2_size));
+            }
+            "mining.notify" => {
                 if !handshake.authorized {
                     return Err(eyre::eyre!(
-                        "received lotus.precomputed_work before successful authorize"
+                        "received mining.notify before successful authorize"
                     ));
                 }
                 let params = v
                     .get("params")
                     .and_then(|p| p.as_array())
-                    .ok_or_else(|| eyre::eyre!("invalid lotus.precomputed_work params"))?;
-                let parsed = parse_precomputed_work_params(params)?;
+                    .ok_or_else(|| eyre::eyre!("invalid mining.notify params"))?;
+                let parsed = parse_notify_params(params)?;
+                let settings = server.stratum_settings.lock().await;
+                let extranonce1 = settings.stratum_extranonce1.clone();
+                let share_target_le = difficulty_target_le(settings.stratum_difficulty)?;
+                let extranonce2_size = settings.stratum_extranonce2_size;
+                drop(settings);
+
+                if extranonce2_size != 4 {
+                    return Err(eyre::eyre!("unsupported extranonce2_size {}; expected 4", extranonce2_size));
+                }
+
+                let extranonce2 = format!("{:08x}", 0u32);
+                let header_160 = build_stratum_header(&parsed, &extranonce1, &extranonce2, "0000000000000000")?;
 
                 let mut block_state = server.block_state.lock().await;
-                block_state.current_work =
-                    Work::from_header(parsed.header_160, parsed.share_target_le);
+                block_state.current_work = Work::from_header(header_160, share_target_le);
                 if parsed.clean_jobs {
                     block_state.current_work.nonce_idx = 0;
                 }
+                let parsed_job_id = parsed.job_id.clone();
+                let parsed_clean_jobs = parsed.clean_jobs;
                 block_state.stratum_job = Some(StratumJob {
-                    job_id: parsed.job_id.clone(),
+                    job_id: parsed_job_id.clone(),
                     ntime_hex_6b: parsed.ntime_hex_6b.clone(),
-                    extranonce2: parsed.extranonce2.clone(),
+                    notify: parsed,
+                    share_target_le,
+                    extranonce2_counter: 0,
                 });
                 drop(block_state);
                 server.log().info(format!(
-                    "Work update: lotus.precomputed_work job_id={} clean_jobs={}",
-                    parsed.job_id, parsed.clean_jobs
+                    "Work update: mining.notify job_id={} clean_jobs={}",
+                    parsed_job_id, parsed_clean_jobs
                 ));
-            }
-            "mining.notify" => {
-                server
-                    .log()
-                    .warn("Ignoring mining.notify; stratum mode requires lotus.precomputed_work");
             }
             _ => {}
         }
@@ -694,11 +782,18 @@ async fn mine_some_nonces_stratum(
     server: ServerRef,
 ) -> Result<Option<(String, String, String, String)>> {
     let log = server.log();
-    let block_state = server.block_state.lock().await;
-    let Some(job) = block_state.stratum_job.clone() else {
+    let mut block_state = server.block_state.lock().await;
+    let Some(mut job) = block_state.stratum_job.clone() else {
         return Ok(None);
     };
 
+    let extranonce2 = format!("{:08x}", job.extranonce2_counter);
+    let settings = server.stratum_settings.lock().await;
+    let extranonce1 = settings.stratum_extranonce1.clone();
+    drop(settings);
+
+    let header_160 = build_stratum_header(&job.notify, &extranonce1, &extranonce2, "0000000000000000")?;
+    block_state.current_work = Work::from_header(header_160, job.share_target_le);
     let mut work = block_state.current_work;
     let big_nonce = server.rng.lock().await.gen();
     work.set_big_nonce(big_nonce);
@@ -721,6 +816,8 @@ async fn mine_some_nonces_stratum(
 
     let mut block_state = server.block_state.lock().await;
     block_state.current_work.nonce_idx = block_state.current_work.nonce_idx.wrapping_add(1);
+    job.extranonce2_counter = job.extranonce2_counter.wrapping_add(1);
+    block_state.stratum_job = Some(job.clone());
     server
         .metrics_nonces
         .fetch_add(num_nonces_per_search, Ordering::AcqRel);
@@ -731,11 +828,11 @@ async fn mine_some_nonces_stratum(
         let nonce_hex = hex::encode(nonce.to_le_bytes());
         log.info(format!(
             "Candidate share job_id={} extranonce2={} nonce_le={}",
-            job.job_id, job.extranonce2, nonce_hex
+            job.job_id, extranonce2, nonce_hex
         ));
         return Ok(Some((
             job.job_id,
-            job.extranonce2,
+            extranonce2,
             job.ntime_hex_6b,
             nonce_hex,
         )));
@@ -1027,33 +1124,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_precomputed_work_params_validates_shape() {
+    fn parse_notify_params_validates_shape() {
         let params = vec![
             Value::String("job-1".to_string()),
-            Value::String("00".repeat(160)),
-            Value::String("11".repeat(32)),
-            Value::String("00112233".to_string()),
+            Value::String("00".repeat(32)),
+            Value::String("11".repeat(10)),
+            Value::String("22".repeat(10)),
+            Value::Array(vec![]),
+            Value::String("01000000".to_string()),
+            Value::String("ffff001d".to_string()),
             Value::String("aabbccddeeff".to_string()),
             Value::Bool(true),
         ];
 
-        let parsed = parse_precomputed_work_params(&params).unwrap();
+        let parsed = parse_notify_params(&params).unwrap();
         assert_eq!(parsed.job_id, "job-1");
-        assert_eq!(parsed.extranonce2, "00112233");
         assert_eq!(parsed.ntime_hex_6b, "aabbccddeeff");
         assert!(parsed.clean_jobs);
     }
 
     #[test]
-    fn parse_precomputed_work_params_rejects_invalid_lengths() {
+    fn parse_notify_params_rejects_invalid_lengths() {
         let params = vec![
             Value::String("job-1".to_string()),
-            Value::String("00".repeat(159)),
-            Value::String("11".repeat(32)),
-            Value::String("00112233".to_string()),
-            Value::String("aabbccddeeff".to_string()),
-            Value::Bool(false),
+            Value::String("00".repeat(32)),
         ];
-        assert!(parse_precomputed_work_params(&params).is_err());
+        assert!(parse_notify_params(&params).is_err());
     }
 }

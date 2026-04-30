@@ -1,5 +1,6 @@
 use std::io::Write;
 
+use bitcoinsuite_core::LotusAddress;
 use clap::{crate_description, crate_version, load_yaml, App};
 use config::{Config, ConfigError, File};
 use serde::Deserialize;
@@ -168,10 +169,13 @@ impl ConfigSettings {
         }
 
         let stratum_url = s.get_str("stratum_url").unwrap_or_default();
-        if !stratum_url.trim().is_empty() && matches.value_of("stratum_password").is_none() {
-            return Err(ConfigError::Message(
-                "stratum mode requires --stratum-password on cmdline".to_string(),
-            ));
+        if !stratum_url.trim().is_empty() {
+            let mine_to_address = s.get_str("mine_to_address").unwrap_or_default();
+            if mine_to_address.parse::<LotusAddress>().is_err() {
+                return Err(ConfigError::Message(
+                    "stratum mode requires mine_to_address to be a valid Lotus address".to_string(),
+                ));
+            }
         }
 
         s.try_into()

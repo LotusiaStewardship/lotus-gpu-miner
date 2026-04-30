@@ -5,10 +5,10 @@ mod sha256;
 
 use eyre::Result;
 pub use miner::Miner;
-use primitive_types::U256;
 pub use settings::ConfigSettings;
 
 use std::{
+    collections::HashMap,
     convert::TryInto,
     fmt::Display,
     sync::{
@@ -18,13 +18,13 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use bitcoinsuite_core::LotusAddress;
 use block::{create_block, Block, GetRawUnsolvedBlockResponse};
 use miner::{MiningSettings, Work};
 use rand::{Rng, SeedableRng};
 use reqwest::{RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::Digest;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
@@ -96,14 +96,118 @@ struct BlockState {
 #[derive(Debug, Clone)]
 struct StratumJob {
     job_id: String,
-    prevhash: String,
-    coinbase1: String,
-    coinbase2: String,
-    merkle_branches: Vec<String>,
-    version: String,
-    nbits: String,
     ntime_hex_6b: String,
     extranonce2: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingRequestKind {
+    Subscribe,
+    Authorize,
+    Submit {
+        job_id: String,
+        extranonce2: String,
+        ntime_hex_6b: String,
+        nonce_hex_8b: String,
+    },
+    Ping,
+}
+
+#[derive(Debug, Default)]
+struct StratumShareStats {
+    accepted: u64,
+    rejected: u64,
+    errored: u64,
+}
+
+#[derive(Debug, Default)]
+struct StratumHandshakeState {
+    subscribed: bool,
+    authorized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedPrecomputedWork {
+    job_id: String,
+    header_160: [u8; 160],
+    share_target_le: [u8; 32],
+    extranonce2: String,
+    ntime_hex_6b: String,
+    clean_jobs: bool,
+}
+
+fn is_valid_lotus_identity(s: &str) -> bool {
+    s.parse::<LotusAddress>().is_ok()
+}
+
+fn parse_precomputed_work_params(params: &[Value]) -> Result<ParsedPrecomputedWork> {
+    if params.len() != 6 {
+        return Err(eyre::eyre!(
+            "lotus.precomputed_work params must have length 6"
+        ));
+    }
+
+    let job_id = params[0]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("invalid job_id in lotus.precomputed_work"))?
+        .to_string();
+    if job_id.trim().is_empty() {
+        return Err(eyre::eyre!("empty job_id in lotus.precomputed_work"));
+    }
+
+    let header_160_hex = params[1]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("invalid header_160_hex in lotus.precomputed_work"))?;
+    if header_160_hex.len() != 320 || !header_160_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(eyre::eyre!(
+            "invalid header_160_hex in lotus.precomputed_work"
+        ));
+    }
+    let header_vec = hex::decode(header_160_hex)?;
+    let mut header_160 = [0u8; 160];
+    header_160.copy_from_slice(&header_vec);
+
+    let share_target_hex = params[2]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("invalid share_target_hex in lotus.precomputed_work"))?;
+    if share_target_hex.len() != 64 || !share_target_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(eyre::eyre!(
+            "invalid share_target_hex in lotus.precomputed_work"
+        ));
+    }
+    let target_vec = hex::decode(share_target_hex)?;
+    let mut share_target_le = [0u8; 32];
+    share_target_le.copy_from_slice(&target_vec);
+    share_target_le.reverse();
+
+    let extranonce2 = params[3]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("invalid extranonce2 in lotus.precomputed_work"))?
+        .to_string();
+    if extranonce2.len() != 8 || !extranonce2.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(eyre::eyre!("invalid extranonce2 in lotus.precomputed_work"));
+    }
+
+    let ntime_hex_6b = params[4]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("invalid ntime in lotus.precomputed_work"))?
+        .to_string();
+    if ntime_hex_6b.len() != 12 || !ntime_hex_6b.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(eyre::eyre!("invalid ntime in lotus.precomputed_work"));
+    }
+
+    let clean_jobs = params[5]
+        .as_bool()
+        .ok_or_else(|| eyre::eyre!("invalid clean_jobs in lotus.precomputed_work"))?;
+
+    Ok(ParsedPrecomputedWork {
+        job_id,
+        header_160,
+        share_target_le,
+        extranonce2,
+        ntime_hex_6b,
+        clean_jobs,
+    })
 }
 
 pub type ServerRef = Arc<Server>;
@@ -202,6 +306,11 @@ impl Server {
         if miner_addr.trim().is_empty() {
             return Err(eyre::eyre!("mine_to_address must be set for stratum mode"));
         }
+        if !is_valid_lotus_identity(&miner_addr) {
+            return Err(eyre::eyre!(
+                "stratum mode requires mine_to_address in lotus_* format"
+            ));
+        }
         let worker_name = self
             .stratum_settings
             .lock()
@@ -262,6 +371,7 @@ async fn run_stratum(server: ServerRef) -> Result<(), Box<dyn std::error::Error>
 
         match run_stratum_session(Arc::clone(&server), &stratum_url).await {
             Ok(()) => {
+                backoff_secs = 1;
                 server.log().warn("Stratum session ended, reconnecting");
             }
             Err(err) => {
@@ -285,6 +395,9 @@ async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()>
     let mut reader = BufReader::new(reader_half);
     let mut line = String::new();
     let mut req_id: u64 = 1;
+    let mut pending: HashMap<u64, PendingRequestKind> = HashMap::new();
+    let mut share_stats = StratumShareStats::default();
+    let mut handshake = StratumHandshakeState::default();
 
     let worker_name = server.stratum_worker_full_name().await?;
     let stratum_password = server
@@ -296,6 +409,7 @@ async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()>
 
     let subscribe_id = req_id;
     req_id += 1;
+    pending.insert(subscribe_id, PendingRequestKind::Subscribe);
     let subscribe = serde_json::json!({
         "id": subscribe_id,
         "method": "mining.subscribe",
@@ -305,20 +419,9 @@ async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()>
         .write_all(format!("{}\n", subscribe).as_bytes())
         .await?;
     server.log().info("Sent mining.subscribe");
-
-    let authorize_id = req_id;
-    req_id += 1;
-    let authorize = serde_json::json!({
-        "id": authorize_id,
-        "method": "mining.authorize",
-        "params": [worker_name, stratum_password]
-    });
-    writer_half
-        .write_all(format!("{}\n", authorize).as_bytes())
-        .await?;
-    server.log().info("Sent mining.authorize");
     server.log().info("Optional methods (extranonce.subscribe / suggest_difficulty / set_extranonce) are scaffolded but disabled by default");
 
+    let mut authorize_sent = false;
     let mut last_outbound = std::time::Instant::now();
     loop {
         line.clear();
@@ -328,41 +431,76 @@ async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()>
                 if n == 0 {
                     return Err(eyre::eyre!("stratum socket closed"));
                 }
-                handle_stratum_line(&server, line.trim_end(), subscribe_id, authorize_id).await?;
+                if line.len() > 8192 {
+                    return Err(eyre::eyre!("stratum line exceeds 8192 bytes"));
+                }
+                handle_stratum_line(
+                    &server,
+                    line.trim_end(),
+                    &mut pending,
+                    &mut share_stats,
+                    &mut handshake,
+                )
+                .await?;
+                if handshake.subscribed && !authorize_sent {
+                    let authorize_id = req_id;
+                    req_id += 1;
+                    pending.insert(authorize_id, PendingRequestKind::Authorize);
+                    let authorize = serde_json::json!({
+                        "id": authorize_id,
+                        "method": "mining.authorize",
+                        "params": [worker_name, stratum_password]
+                    });
+                    writer_half
+                        .write_all(format!("{}\n", authorize).as_bytes())
+                        .await?;
+                    authorize_sent = true;
+                    last_outbound = std::time::Instant::now();
+                    server.log().info("Sent mining.authorize");
+                }
             }
             _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                if let Some((job_id, extranonce2, ntime, nonce_hex)) = mine_some_nonces_stratum(Arc::clone(&server)).await? {
-                    let submit_id = req_id;
-                    req_id += 1;
-                    let submit = serde_json::json!({
-                        "id": submit_id,
-                        "method": "mining.submit",
-                        "params": [
-                            server.stratum_worker_full_name().await?,
+                if handshake.authorized {
+                    if let Some((job_id, extranonce2, ntime, nonce_hex)) = mine_some_nonces_stratum(Arc::clone(&server)).await? {
+                        let submit_id = req_id;
+                        req_id += 1;
+                        let submit = serde_json::json!({
+                            "id": submit_id,
+                            "method": "mining.submit",
+                            "params": [
+                                server.stratum_worker_full_name().await?,
+                                job_id,
+                                extranonce2,
+                                ntime,
+                                nonce_hex,
+                            ]
+                        });
+                        writer_half
+                            .write_all(format!("{}\n", submit).as_bytes())
+                            .await?;
+                        pending.insert(submit_id, PendingRequestKind::Submit {
                             job_id,
                             extranonce2,
-                            ntime,
-                            nonce_hex,
-                        ]
-                    });
-                    writer_half
-                        .write_all(format!("{}\n", submit).as_bytes())
-                        .await?;
-                    last_outbound = std::time::Instant::now();
-                    server.log().info(format!("Sent mining.submit id={}", submit_id));
-                } else if last_outbound.elapsed() >= Duration::from_secs(30) {
-                    let ping_id = req_id;
-                    req_id += 1;
-                    let ping = serde_json::json!({
-                        "id": ping_id,
-                        "method": "mining.ping",
-                        "params": []
-                    });
-                    writer_half
-                        .write_all(format!("{}\n", ping).as_bytes())
-                        .await?;
-                    last_outbound = std::time::Instant::now();
-                    server.log().info(format!("Sent mining.ping id={}", ping_id));
+                            ntime_hex_6b: ntime,
+                            nonce_hex_8b: nonce_hex,
+                        });
+                        last_outbound = std::time::Instant::now();
+                        server.log().info(format!("Sent mining.submit id={}", submit_id));
+                    } else if last_outbound.elapsed() >= Duration::from_secs(30) {
+                        let ping_id = req_id;
+                        req_id += 1;
+                        let ping = serde_json::json!({
+                            "id": ping_id,
+                            "method": "mining.ping",
+                            "params": []
+                        });
+                        writer_half
+                            .write_all(format!("{}\n", ping).as_bytes())
+                            .await?;
+                        pending.insert(ping_id, PendingRequestKind::Ping);
+                        last_outbound = std::time::Instant::now();
+                        server.log().info(format!("Sent mining.ping id={}", ping_id));
+                    }
                 }
             }
         }
@@ -372,8 +510,9 @@ async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()>
 async fn handle_stratum_line(
     server: &Server,
     line: &str,
-    subscribe_id: u64,
-    authorize_id: u64,
+    pending: &mut HashMap<u64, PendingRequestKind>,
+    share_stats: &mut StratumShareStats,
+    handshake: &mut StratumHandshakeState,
 ) -> Result<()> {
     let v: Value = serde_json::from_str(line)?;
 
@@ -390,100 +529,39 @@ async fn handle_stratum_line(
                 server.stratum_settings.lock().await.stratum_difficulty = diff;
                 server.log().info(format!("set_difficulty={}", diff));
             }
-            "mining.notify" => {
+            "lotus.precomputed_work" => {
+                if !handshake.authorized {
+                    return Err(eyre::eyre!(
+                        "received lotus.precomputed_work before successful authorize"
+                    ));
+                }
                 let params = v
                     .get("params")
                     .and_then(|p| p.as_array())
-                    .ok_or_else(|| eyre::eyre!("invalid mining.notify params"))?;
-                let job_id = params
-                    .get(0)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let prevhash =
-                    normalize_hex_len(params.get(1).and_then(|v| v.as_str()).unwrap_or(""), 64);
-                let coinbase1 = params
-                    .get(2)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let coinbase2 = params
-                    .get(3)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let merkle_branches = params
-                    .get(4)
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let version =
-                    normalize_hex_len(params.get(5).and_then(|v| v.as_str()).unwrap_or(""), 8);
-                let nbits =
-                    normalize_hex_len(params.get(6).and_then(|v| v.as_str()).unwrap_or(""), 8);
-                let ntime_hex_6b = normalize_hex_len(
-                    params
-                        .get(7)
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("000000000000"),
-                    12,
-                );
-                let clean_jobs = params.get(8).and_then(|v| v.as_bool()).unwrap_or(false);
+                    .ok_or_else(|| eyre::eyre!("invalid lotus.precomputed_work params"))?;
+                let parsed = parse_precomputed_work_params(params)?;
 
-                let mut header = [0u8; 160];
-                if let Some(prevhash) = params.get(1).and_then(|v| v.as_str()) {
-                    let prev = hex::decode(prevhash).unwrap_or_default();
-                    let copy_len = prev.len().min(32);
-                    header[..copy_len].copy_from_slice(&prev[..copy_len]);
-                }
-                if let Some(version) = params.get(5).and_then(|v| v.as_str()) {
-                    let version = hex::decode(version).unwrap_or_default();
-                    let copy_len = version.len().min(4);
-                    header[32..32 + copy_len].copy_from_slice(&version[..copy_len]);
-                }
-                if let Some(nbits) = params.get(6).and_then(|v| v.as_str()) {
-                    let nbits = hex::decode(nbits).unwrap_or_default();
-                    let copy_len = nbits.len().min(4);
-                    header[36..36 + copy_len].copy_from_slice(&nbits[..copy_len]);
-                }
-                if let Ok(ntime) = hex::decode(&ntime_hex_6b) {
-                    let copy_len = ntime.len().min(6);
-                    header[40..40 + copy_len].copy_from_slice(&ntime[..copy_len]);
-                }
-
-                let difficulty = server.stratum_settings.lock().await.stratum_difficulty;
-                let target = difficulty_to_target(difficulty);
                 let mut block_state = server.block_state.lock().await;
-                block_state.current_work = Work::from_header(header, target);
-                if clean_jobs {
+                block_state.current_work =
+                    Work::from_header(parsed.header_160, parsed.share_target_le);
+                if parsed.clean_jobs {
                     block_state.current_work.nonce_idx = 0;
                 }
-                let extranonce2_size = server
-                    .stratum_settings
-                    .lock()
-                    .await
-                    .stratum_extranonce2_size;
-                let extranonce2 = random_extranonce2(extranonce2_size);
                 block_state.stratum_job = Some(StratumJob {
-                    job_id: job_id.clone(),
-                    prevhash,
-                    coinbase1,
-                    coinbase2,
-                    merkle_branches,
-                    version,
-                    nbits,
-                    ntime_hex_6b,
-                    extranonce2,
+                    job_id: parsed.job_id.clone(),
+                    ntime_hex_6b: parsed.ntime_hex_6b.clone(),
+                    extranonce2: parsed.extranonce2.clone(),
                 });
                 drop(block_state);
                 server.log().info(format!(
-                    "Work update: mining.notify job_id={} clean_jobs={} difficulty={}",
-                    job_id, clean_jobs, difficulty
+                    "Work update: lotus.precomputed_work job_id={} clean_jobs={}",
+                    parsed.job_id, parsed.clean_jobs
                 ));
+            }
+            "mining.notify" => {
+                server
+                    .log()
+                    .warn("Ignoring mining.notify; stratum mode requires lotus.precomputed_work");
             }
             _ => {}
         }
@@ -491,13 +569,14 @@ async fn handle_stratum_line(
     }
 
     let id = v.get("id").and_then(|id| id.as_u64()).unwrap_or(0);
+    let kind = pending.remove(&id);
     let err = v.get("error");
-    if id == subscribe_id {
-        if err.is_some() && !err.unwrap().is_null() {
-            server
-                .log()
-                .error(format!("mining.subscribe failed: {}", err.unwrap()));
-        } else {
+
+    match kind {
+        Some(PendingRequestKind::Subscribe) => {
+            if err.is_some() && !err.is_none_or(|e| e.is_null()) {
+                return Err(eyre::eyre!("mining.subscribe failed: {}", err.unwrap()));
+            }
             let extranonce1 = v
                 .get("result")
                 .and_then(|r| r.as_array())
@@ -514,132 +593,101 @@ async fn handle_stratum_line(
             let mut settings = server.stratum_settings.lock().await;
             settings.stratum_extranonce1 = extranonce1;
             settings.stratum_extranonce2_size = extranonce2_size;
+            handshake.subscribed = true;
             server.log().info(format!(
                 "mining.subscribe OK extranonce2_size={}",
                 extranonce2_size
             ));
         }
-    } else if id == authorize_id {
-        if err.is_some() && !err.unwrap().is_null() {
-            server
-                .log()
-                .error(format!("mining.authorize failed: {}", err.unwrap()));
-        } else {
+        Some(PendingRequestKind::Authorize) => {
+            if err.is_some() && !err.is_none_or(|e| e.is_null()) {
+                return Err(eyre::eyre!("mining.authorize failed: {}", err.unwrap()));
+            }
             let ok = v.get("result").and_then(|r| r.as_bool()).unwrap_or(false);
             if ok {
+                handshake.authorized = true;
                 server.log().info("mining.authorize OK");
             } else {
-                server.log().error("mining.authorize rejected by server");
+                return Err(eyre::eyre!("mining.authorize rejected by server"));
             }
         }
-    } else if err.is_some() && !err.unwrap().is_null() {
-        server
-            .log()
-            .warn(format!("Stratum response id={} error={}", id, err.unwrap()));
-    } else if let Some(result_bool) = v.get("result").and_then(|r| r.as_bool()) {
-        if result_bool {
-            server.log().info(format!("Share accepted id={}", id));
-        } else {
-            server
-                .log()
-                .warn(format!("Share rejected id={} (result=false)", id));
+        Some(PendingRequestKind::Submit {
+            job_id,
+            extranonce2,
+            ntime_hex_6b,
+            nonce_hex_8b,
+        }) => {
+            if err.is_some() && !err.is_none_or(|e| e.is_null()) {
+                share_stats.errored += 1;
+                server.log().warn(format!(
+                    "Share errored id={} job_id={} extranonce2={} ntime={} nonce={} error={} (a/r/e={}/{}/{})",
+                    id,
+                    job_id,
+                    extranonce2,
+                    ntime_hex_6b,
+                    nonce_hex_8b,
+                    err.unwrap(),
+                    share_stats.accepted,
+                    share_stats.rejected,
+                    share_stats.errored
+                ));
+            } else if let Some(result_bool) = v.get("result").and_then(|r| r.as_bool()) {
+                if result_bool {
+                    share_stats.accepted += 1;
+                    server.log().info(format!(
+                        "Share accepted id={} job_id={} extranonce2={} ntime={} nonce={} (a/r/e={}/{}/{})",
+                        id,
+                        job_id,
+                        extranonce2,
+                        ntime_hex_6b,
+                        nonce_hex_8b,
+                        share_stats.accepted,
+                        share_stats.rejected,
+                        share_stats.errored
+                    ));
+                } else {
+                    share_stats.rejected += 1;
+                    server.log().warn(format!(
+                        "Share rejected id={} job_id={} extranonce2={} ntime={} nonce={} (a/r/e={}/{}/{})",
+                        id,
+                        job_id,
+                        extranonce2,
+                        ntime_hex_6b,
+                        nonce_hex_8b,
+                        share_stats.accepted,
+                        share_stats.rejected,
+                        share_stats.errored
+                    ));
+                }
+            } else {
+                share_stats.errored += 1;
+                server.log().warn(format!(
+                    "Share response missing boolean result id={} job_id={} (a/r/e={}/{}/{})",
+                    id, job_id, share_stats.accepted, share_stats.rejected, share_stats.errored
+                ));
+            }
+        }
+        Some(PendingRequestKind::Ping) => {
+            if err.is_some() && !err.is_none_or(|e| e.is_null()) {
+                server.log().warn(format!(
+                    "mining.ping error id={} error={}",
+                    id,
+                    err.unwrap()
+                ));
+            }
+        }
+        None => {
+            if err.is_some() && !err.is_none_or(|e| e.is_null()) {
+                server.log().warn(format!(
+                    "Uncorrelated stratum response id={} error={}",
+                    id,
+                    err.unwrap()
+                ));
+            }
         }
     }
 
     Ok(())
-}
-
-fn difficulty_to_target(difficulty: f64) -> [u8; 32] {
-    let target = target_for_share_difficulty(difficulty).unwrap_or_else(|_| U256::MAX);
-    let mut out = [0u8; 32];
-    target.to_big_endian(&mut out);
-    out
-}
-
-fn share_meets_server_target(
-    job: &StratumJob,
-    extranonce1: &str,
-    difficulty: f64,
-    nonce_hex_8b: &str,
-) -> Result<bool> {
-    let coinbase = hex::decode(format!(
-        "{}{}{}{}",
-        job.coinbase1, extranonce1, job.extranonce2, job.coinbase2
-    ))?;
-    let mut merkle = sha256d(&coinbase).to_vec();
-    for branch_hex in &job.merkle_branches {
-        let branch = hex::decode(branch_hex)?;
-        let mut concat = Vec::with_capacity(64);
-        concat.extend_from_slice(&merkle);
-        concat.extend_from_slice(&branch);
-        merkle = sha256d(&concat).to_vec();
-    }
-
-    let mut header = Vec::with_capacity(4 + 32 + 32 + 6 + 4 + 8);
-    header.extend_from_slice(&hex::decode(&job.version)?);
-    header.extend_from_slice(&hex::decode(&job.prevhash)?);
-    header.extend_from_slice(&merkle);
-    header.extend_from_slice(&hex::decode(&job.ntime_hex_6b)?);
-    header.extend_from_slice(&hex::decode(&job.nbits)?);
-    header.extend_from_slice(&hex::decode(nonce_hex_8b)?);
-
-    let mut hash_be = sha256d(&header);
-    hash_be.reverse();
-    let hash_u256 = U256::from_big_endian(&hash_be);
-    let share_target = target_for_share_difficulty(difficulty)?;
-    Ok(hash_u256 <= share_target)
-}
-
-fn target_for_share_difficulty(difficulty: f64) -> Result<U256> {
-    const DIFF1_TARGET_HEX: &str =
-        "00000000ffff0000000000000000000000000000000000000000000000000000";
-    const DIFF_SCALE: u128 = 100_000_000;
-
-    if difficulty <= 0.0 || !difficulty.is_finite() {
-        return Err(eyre::eyre!("invalid difficulty"));
-    }
-    let scaled = (difficulty * DIFF_SCALE as f64).round();
-    if scaled <= 0.0 || !scaled.is_finite() {
-        return Err(eyre::eyre!("invalid difficulty scale"));
-    }
-    let scaled_u = U256::from(scaled as u128);
-    let mut diff1_bytes = [0u8; 32];
-    let raw = hex::decode(DIFF1_TARGET_HEX)?;
-    diff1_bytes.copy_from_slice(&raw);
-    let diff1 = U256::from_big_endian(&diff1_bytes);
-    let scaled_diff1 = diff1 * U256::from(DIFF_SCALE);
-    let mut target = scaled_diff1 / scaled_u;
-    if target.is_zero() {
-        target = U256::one();
-    }
-    Ok(target)
-}
-
-fn sha256d(bytes: &[u8]) -> [u8; 32] {
-    let h1 = sha2::Sha256::digest(bytes);
-    let h2 = sha2::Sha256::digest(&h1);
-    h2.into()
-}
-
-fn random_extranonce2(extranonce2_size: usize) -> String {
-    let bytes = extranonce2_size.max(1).min(16);
-    let mut out = String::new();
-    for _ in 0..bytes {
-        let b: u8 = rand::thread_rng().gen();
-        out.push_str(&format!("{:02x}", b));
-    }
-    out
-}
-
-fn normalize_hex_len(value: &str, len: usize) -> String {
-    let mut s = value.trim().to_ascii_lowercase();
-    if s.len() > len {
-        s.truncate(len);
-    }
-    while s.len() < len {
-        s.push('0');
-    }
-    s
 }
 
 async fn mine_some_nonces_stratum(
@@ -679,20 +727,10 @@ async fn mine_some_nonces_stratum(
     update_hashrate(server.as_ref(), log).await;
 
     if let Some(nonce) = nonce {
-        let nonce_hex = format!("{:016x}", nonce);
-        let settings = server.stratum_settings.lock().await;
-        let difficulty = settings.stratum_difficulty;
-        let extranonce1 = settings.stratum_extranonce1.clone();
-        drop(settings);
-        if !share_meets_server_target(&job, &extranonce1, difficulty, &nonce_hex)? {
-            log.warn(format!(
-                "Candidate filtered (below stratum difficulty): job_id={} extranonce2={} nonce={}",
-                job.job_id, job.extranonce2, nonce_hex
-            ));
-            return Ok(None);
-        }
+        // Submit nonce as the exact 8 header bytes in little-endian order.
+        let nonce_hex = hex::encode(nonce.to_le_bytes());
         log.info(format!(
-            "Candidate share job_id={} extranonce2={} nonce={}",
+            "Candidate share job_id={} extranonce2={} nonce_le={}",
             job.job_id, job.extranonce2, nonce_hex
         ));
         return Ok(Some((
@@ -972,5 +1010,50 @@ impl Display for HashrateEntry {
             self.timestamp.to_rfc3339(),
             self.hashrate / 1_000_000.0
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lotus_identity_requires_prefix_and_payload() {
+        assert!(is_valid_lotus_identity(
+            "lotus_16PSJNf1EDEfGvaYzaXJCJZrXH4pgiTo7kyW61iGi"
+        ));
+        assert!(!is_valid_lotus_identity("lotus_"));
+        assert!(!is_valid_lotus_identity("ecash:q..."));
+    }
+
+    #[test]
+    fn parse_precomputed_work_params_validates_shape() {
+        let params = vec![
+            Value::String("job-1".to_string()),
+            Value::String("00".repeat(160)),
+            Value::String("11".repeat(32)),
+            Value::String("00112233".to_string()),
+            Value::String("aabbccddeeff".to_string()),
+            Value::Bool(true),
+        ];
+
+        let parsed = parse_precomputed_work_params(&params).unwrap();
+        assert_eq!(parsed.job_id, "job-1");
+        assert_eq!(parsed.extranonce2, "00112233");
+        assert_eq!(parsed.ntime_hex_6b, "aabbccddeeff");
+        assert!(parsed.clean_jobs);
+    }
+
+    #[test]
+    fn parse_precomputed_work_params_rejects_invalid_lengths() {
+        let params = vec![
+            Value::String("job-1".to_string()),
+            Value::String("00".repeat(159)),
+            Value::String("11".repeat(32)),
+            Value::String("00112233".to_string()),
+            Value::String("aabbccddeeff".to_string()),
+            Value::Bool(false),
+        ];
+        assert!(parse_precomputed_work_params(&params).is_err());
     }
 }

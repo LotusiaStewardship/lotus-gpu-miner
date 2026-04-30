@@ -211,7 +211,7 @@ impl Miner {
         self.buffer.read(&mut vec).enq().map_err(Ocl)?;
         if vec[0x80] != 0 {
             let mut header = work.header;
-            'nonce: for &nonce in &vec[..0x7f] {
+            for &nonce in &vec[..0x7f] {
                 let nonce = nonce.swap_bytes();
                 if nonce != 0 {
                     header[44..48].copy_from_slice(&nonce.to_le_bytes());
@@ -230,13 +230,18 @@ impl Miner {
                                    developers.",
                         );
                     }
+                    let mut below_or_equal_target = true;
                     for (&h, &t) in hash.iter().zip(work.target.iter()).rev() {
                         if h > t {
-                            continue 'nonce;
+                            below_or_equal_target = false;
+                            break;
                         }
-                        if t > h {
-                            return Ok(Some(result_nonce));
+                        if h < t {
+                            break;
                         }
+                    }
+                    if below_or_equal_target {
+                        return Ok(Some(result_nonce));
                     }
                 }
             }

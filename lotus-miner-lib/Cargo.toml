@@ -22,3 +22,4 @@ chrono = "0.4.19"
 eyre = "0.6.5"
 thiserror = "1.0"
 primitive-types = "0.12"
+bitcoinsuite-core = { path = "../../bitcoinsuite/bitcoinsuite-core" }

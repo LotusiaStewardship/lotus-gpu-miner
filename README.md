@@ -33,7 +33,7 @@ All existing solo config options remain valid and unchanged.
 ### Example config (backward-compatible, with new optional Stratum fields)
 
 ```toml
-mine_to_address = "bchtest:qqegajxrzx9juvg9fuu4cqvndz3u2yz6eg6jfudlvh"
+mine_to_address = "lotus_16PSJ..."
 rpc_url = "http://127.0.0.1:10605"
 rpc_poll_interval = 3
 rpc_user = "lotus"
@@ -88,10 +88,22 @@ When `stratum_url` is set:
    - `mining.subscribe`
    - `mining.authorize`
 3. Receive and handle:
-   - `mining.notify`
+   - `lotus.precomputed_work` (`share_target_hex` is server big-endian and normalized internally)
    - `mining.set_difficulty`
-4. Mine shares with OpenCL
+
+`lotus.precomputed_work` is strictly validated as:
+- params length exactly `6`
+- `job_id`: non-empty string
+- `header_160_hex`: exactly 320 hex chars (160 bytes)
+- `share_target_hex`: exactly 64 hex chars (32 bytes, big-endian on wire)
+- `extranonce2_hex`: exactly 8 hex chars
+- `ntime_hex_6b`: exactly 12 hex chars
+- `clean_jobs`: boolean
+4. Mine shares with OpenCL directly on server-precomputed work
 5. Submit shares using `mining.submit`
+
+In Stratum mode, the miner must consume `lotus.precomputed_work` and does not build headers locally.
+Header construction is solo-mode-only.
 
 ### Reconnect policy
 
@@ -119,7 +131,7 @@ The miner logs:
 
 - selected runtime mode (solo/stratum)
 - Stratum connect/authorize/subscribe lifecycle
-- new notify jobs and difficulty updates
+- new precomputed work jobs and difficulty updates
 - candidate share finds and submit attempts
 - reconnect/backoff behavior
 - hashrate report lines

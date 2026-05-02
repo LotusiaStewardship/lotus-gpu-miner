@@ -143,6 +143,10 @@ struct ParsedNotify {
     nbits: String,
     ntime_hex_6b: String,
     clean_jobs: bool,
+    // Lotus-specific extensions
+    block_height: i32,
+    epoch_hash_hex: String,
+    extended_metadata_hash_hex: String,
 }
 
 fn is_valid_lotus_identity(s: &str) -> bool {
@@ -150,8 +154,9 @@ fn is_valid_lotus_identity(s: &str) -> bool {
 }
 
 fn parse_notify_params(params: &[Value]) -> Result<ParsedNotify> {
-    if params.len() != 9 {
-        return Err(eyre::eyre!("mining.notify params must have length 9"));
+    // Standard stratum params (9) + Lotus extensions (3: height, epoch_hash, extended_metadata_hash)
+    if params.len() < 9 {
+        return Err(eyre::eyre!("mining.notify params must have length >= 9"));
     }
     let job_id = params[0]
         .as_str()
@@ -195,6 +200,20 @@ fn parse_notify_params(params: &[Value]) -> Result<ParsedNotify> {
         .as_bool()
         .ok_or_else(|| eyre::eyre!("invalid clean_jobs in mining.notify"))?;
 
+    // Parse Lotus-specific extensions (optional, default to 0/zero-hash for backward compat)
+    let block_height = params.get(9)
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(0);
+    let epoch_hash_hex = params.get(10)
+        .and_then(|v| v.as_str())
+        .unwrap_or("0000000000000000000000000000000000000000000000000000000000000000")
+        .to_string();
+    let extended_metadata_hash_hex = params.get(11)
+        .and_then(|v| v.as_str())
+        .unwrap_or("0000000000000000000000000000000000000000000000000000000000000000")
+        .to_string();
+
     Ok(ParsedNotify {
         job_id,
         prevhash,
@@ -205,6 +224,9 @@ fn parse_notify_params(params: &[Value]) -> Result<ParsedNotify> {
         nbits,
         ntime_hex_6b,
         clean_jobs,
+        block_height,
+        epoch_hash_hex,
+        extended_metadata_hash_hex,
     })
 }
 
@@ -557,11 +579,11 @@ async fn handle_stratum_line(
                     eyre::eyre!("invalid extranonce2_size in mining.set_extranonce")
                 })? as usize;
                 let mut settings = server.stratum_settings.lock().await;
-                settings.stratum_extranonce1 = extranonce1;
+                settings.stratum_extranonce1 = extranonce1.clone();
                 settings.stratum_extranonce2_size = extranonce2_size;
                 server.log().info(format!(
-                    "set_extranonce extranonce2_size={}",
-                    extranonce2_size
+                    "set_extranonce extranonce1={} extranonce2_size={}",
+                    extranonce1, extranonce2_size
                 ));
             }
             "mining.notify" => {
@@ -599,6 +621,10 @@ async fn handle_stratum_line(
                     &parsed.nbits,
                     &parsed.ntime_hex_6b,
                     "0000000000000000",
+                    Some(parsed.block_height),
+                    Some(&parsed.epoch_hash_hex),
+                    Some(&parsed.extended_metadata_hash_hex),
+                    None,
                 )?;
                 let header_160: [u8; 160] = header_vec
                     .as_slice()
@@ -778,6 +804,10 @@ async fn mine_some_nonces_stratum(
         &job.notify.nbits,
         &job.notify.ntime_hex_6b,
         "0000000000000000",
+        Some(job.notify.block_height),
+        Some(&job.notify.epoch_hash_hex),
+        Some(&job.notify.extended_metadata_hash_hex),
+        None,
     )?;
     let header_160: [u8; 160] = header_vec
         .as_slice()

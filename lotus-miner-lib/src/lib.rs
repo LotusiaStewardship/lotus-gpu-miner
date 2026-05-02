@@ -147,6 +147,7 @@ struct ParsedNotify {
     block_height: i32,
     epoch_hash_hex: String,
     extended_metadata_hash_hex: String,
+    block_size: u64,
 }
 
 fn is_valid_lotus_identity(s: &str) -> bool {
@@ -213,6 +214,9 @@ fn parse_notify_params(params: &[Value]) -> Result<ParsedNotify> {
         .and_then(|v| v.as_str())
         .unwrap_or("0000000000000000000000000000000000000000000000000000000000000000")
         .to_string();
+    let block_size = params.get(12)
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     Ok(ParsedNotify {
         job_id,
@@ -227,6 +231,7 @@ fn parse_notify_params(params: &[Value]) -> Result<ParsedNotify> {
         block_height,
         epoch_hash_hex,
         extended_metadata_hash_hex,
+        block_size,
     })
 }
 
@@ -624,7 +629,7 @@ async fn handle_stratum_line(
                     Some(parsed.block_height),
                     Some(&parsed.epoch_hash_hex),
                     Some(&parsed.extended_metadata_hash_hex),
-                    None,
+                    Some(parsed.block_size),
                 )?;
                 let header_160: [u8; 160] = header_vec
                     .as_slice()
@@ -807,7 +812,7 @@ async fn mine_some_nonces_stratum(
         Some(job.notify.block_height),
         Some(&job.notify.epoch_hash_hex),
         Some(&job.notify.extended_metadata_hash_hex),
-        None,
+        Some(job.notify.block_size),
     )?;
     let header_160: [u8; 160] = header_vec
         .as_slice()

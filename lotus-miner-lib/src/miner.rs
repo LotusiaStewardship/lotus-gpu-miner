@@ -1,10 +1,10 @@
+use eyre::Result;
 use ocl::{
     builders::{DeviceSpecifier, ProgramBuilder},
     Buffer, Context, Device, Kernel, Platform, Queue,
 };
 use sha2::Digest;
 use std::convert::TryInto;
-use eyre::Result;
 use thiserror::Error;
 
 use crate::{sha256::lotus_hash, Log};
@@ -12,7 +12,7 @@ use crate::{sha256::lotus_hash, Log};
 #[derive(Debug, Error)]
 pub enum MinerError {
     #[error("Ocl error: {0:?}")]
-    Ocl(ocl::Error)
+    Ocl(ocl::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +111,8 @@ impl Miner {
         let ctx = Context::builder()
             .platform(platform.clone())
             .devices(DeviceSpecifier::Single(device.clone()))
-            .build().map_err(Ocl)?;
+            .build()
+            .map_err(Ocl)?;
         let queue = Queue::new(&ctx, device, None).map_err(Ocl)?;
         prog_builder.devices(DeviceSpecifier::Single(device.clone()));
         let program = prog_builder.build(&ctx).map_err(Ocl)?;
@@ -120,13 +121,22 @@ impl Miner {
             .program(&program)
             .name("search")
             .queue(queue.clone());
-        let buffer = Buffer::builder().len(0xff).queue(queue.clone()).build().map_err(Ocl)?;
-        let header_buffer = Buffer::builder().len(0xff).queue(queue).build().map_err(Ocl)?;
+        let buffer = Buffer::builder()
+            .len(0xff)
+            .queue(queue.clone())
+            .build()
+            .map_err(Ocl)?;
+        let header_buffer = Buffer::builder()
+            .len(0xff)
+            .queue(queue)
+            .build()
+            .map_err(Ocl)?;
         let search_kernel = kernel_builder
             .arg_named("offset", 0u32)
             .arg_named("partial_header", None::<&Buffer<u32>>)
             .arg_named("output", None::<&Buffer<u32>>)
-            .build().map_err(Ocl)?;
+            .build()
+            .map_err(Ocl)?;
         Ok(Miner {
             search_kernel,
             buffer,
@@ -153,9 +163,8 @@ impl Miner {
     }
 
     pub fn has_nonces_left(&self, work: &Work) -> bool {
-        work.nonce_idx
-            .checked_mul(self.settings.kernel_size)
-            .is_some()
+        let searched = (work.nonce_idx as u64).saturating_mul(self.num_nonces_per_search());
+        searched <= u32::MAX as u64
     }
 
     pub fn num_nonces_per_search(&self) -> u64 {
@@ -163,19 +172,15 @@ impl Miner {
     }
 
     pub fn find_nonce(&mut self, work: &Work, log: &Log) -> Result<Option<u64>> {
-        let base = match work
-            .nonce_idx
-            .checked_mul(self.num_nonces_per_search().try_into().unwrap())
-        {
-            Some(base) => base,
-            None => {
-                log.error(
-                    "Error: Nonce base overflow, skipping. This could be fixed by lowering \
+        let base_u64 = (work.nonce_idx as u64).saturating_mul(self.num_nonces_per_search());
+        if base_u64 > u32::MAX as u64 {
+            log.error(
+                "Error: Nonce base overflow, skipping. This could be fixed by lowering \
                            rpc_poll_interval.",
-                );
-                return Ok(None);
-            }
-        };
+            );
+            return Ok(None);
+        }
+        let base = base_u64 as u32;
         let mut partial_header = [0u8; 84];
         partial_header[..52].copy_from_slice(&work.header[..52]);
         partial_header[52..].copy_from_slice(&sha2::Sha256::digest(&work.header[52..]));
@@ -183,10 +188,16 @@ impl Miner {
         for (chunk, int) in partial_header.chunks(4).zip(partial_header_ints.iter_mut()) {
             *int = u32::from_be_bytes(chunk.try_into().unwrap());
         }
-        self.header_buffer.write(&partial_header_ints[..]).enq().map_err(Ocl)?;
+        self.header_buffer
+            .write(&partial_header_ints[..])
+            .enq()
+            .map_err(Ocl)?;
         self.search_kernel
-            .set_arg("partial_header", &self.header_buffer).map_err(Ocl)?;
-        self.search_kernel.set_arg("output", &self.buffer).map_err(Ocl)?;
+            .set_arg("partial_header", &self.header_buffer)
+            .map_err(Ocl)?;
+        self.search_kernel
+            .set_arg("output", &self.buffer)
+            .map_err(Ocl)?;
         self.search_kernel.set_arg("offset", base).map_err(Ocl)?;
         let mut vec = vec![0; self.buffer.len()];
         self.buffer.write(&vec).enq().map_err(Ocl)?;
@@ -200,7 +211,7 @@ impl Miner {
         self.buffer.read(&mut vec).enq().map_err(Ocl)?;
         if vec[0x80] != 0 {
             let mut header = work.header;
-            'nonce: for &nonce in &vec[..0x7f] {
+            for &nonce in &vec[..0x7f] {
                 let nonce = nonce.swap_bytes();
                 if nonce != 0 {
                     header[44..48].copy_from_slice(&nonce.to_le_bytes());
@@ -219,13 +230,18 @@ impl Miner {
                                    developers.",
                         );
                     }
+                    let mut below_or_equal_target = true;
                     for (&h, &t) in hash.iter().zip(work.target.iter()).rev() {
                         if h > t {
-                            continue 'nonce;
+                            below_or_equal_target = false;
+                            break;
                         }
-                        if t > h {
-                            return Ok(Some(result_nonce));
+                        if h < t {
+                            break;
                         }
+                    }
+                    if below_or_equal_target {
+                        return Ok(Some(result_nonce));
                     }
                 }
             }

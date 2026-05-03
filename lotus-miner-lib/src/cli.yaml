@@ -40,3 +40,15 @@ args:
                   long: gpu-index
                   help: GPU index
                   takes_value: true
+        - stratum_url:
+                  long: stratum-url
+                  help: Stratum server host:port (enables stratum mode)
+                  takes_value: true
+        - stratum_worker_name:
+                  long: stratum-worker-name
+                  help: Worker suffix, combined as <mine_to_address>.<stratum_worker_name>
+                  takes_value: true
+        - stratum_password:
+                  long: stratum-password
+                  help: Stratum password (typically x)
+                  takes_value: true

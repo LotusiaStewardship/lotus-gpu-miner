@@ -1,6 +1,7 @@
 use std::io::Write;
 
-use clap::{crate_authors, crate_description, crate_version, load_yaml, App};
+use bitcoinsuite_core::LotusAddress;
+use clap::{crate_description, crate_version, load_yaml, App};
 use config::{Config, ConfigError, File};
 use serde::Deserialize;
 
@@ -11,6 +12,7 @@ pub const DEFAULT_RPC_POLL_INTERVAL: i64 = 3;
 pub const FOLDER_DIR: &str = ".lotus-miner";
 pub const DEFAULT_KERNEL_SIZE: i64 = 21;
 pub const DEFAULT_GPU_INDEX: i64 = 0;
+pub const DEFAULT_STRATUM_PASSWORD: &str = "x";
 
 #[derive(Debug, Deserialize)]
 pub struct ConfigSettings {
@@ -21,6 +23,9 @@ pub struct ConfigSettings {
     pub mine_to_address: String,
     pub kernel_size: i64,
     pub gpu_index: i64,
+    pub stratum_url: Option<String>,
+    pub stratum_worker_name: Option<String>,
+    pub stratum_password: Option<String>,
 }
 
 const DEFAULT_CONFIG_FILE_CONTENT: &str = r#"mine_to_address = ""
@@ -30,6 +35,10 @@ rpc_user = "lotus"
 rpc_password = "lotus"
 gpu_index = 0
 kernel_size = 23
+# Optional Stratum mode (host:port only)
+stratum_url = ""
+stratum_worker_name = ""
+stratum_password = "x"
 "#;
 
 impl ConfigSettings {
@@ -40,7 +49,7 @@ impl ConfigSettings {
         let yaml = load_yaml!("cli.yaml");
         let matches = App::from_yaml(yaml)
             .about(crate_description!())
-            .author(crate_authors!("\n"))
+            .author("Lotus contributors")
             .version(crate_version!())
             .get_matches();
         let home_dir = match dirs::home_dir() {
@@ -53,6 +62,9 @@ impl ConfigSettings {
         s.set_default("rpc_password", DEFAULT_PASSWORD)?;
         s.set_default("kernel_size", DEFAULT_KERNEL_SIZE)?;
         s.set_default("gpu_index", DEFAULT_GPU_INDEX)?;
+        s.set_default("stratum_url", "")?;
+        s.set_default("stratum_worker_name", "")?;
+        s.set_default("stratum_password", DEFAULT_STRATUM_PASSWORD)?;
 
         // Load config from file
         let default_config = home_dir;
@@ -144,6 +156,26 @@ impl ConfigSettings {
         // Set the GPU index
         if let Some(gpu_index) = matches.value_of("gpu_index") {
             s.set("gpu_index", gpu_index.parse::<i64>().unwrap())?;
+        }
+
+        if let Some(stratum_url) = matches.value_of("stratum_url") {
+            s.set("stratum_url", stratum_url)?;
+        }
+        if let Some(stratum_worker_name) = matches.value_of("stratum_worker_name") {
+            s.set("stratum_worker_name", stratum_worker_name)?;
+        }
+        if let Some(stratum_password) = matches.value_of("stratum_password") {
+            s.set("stratum_password", stratum_password)?;
+        }
+
+        let stratum_url = s.get_str("stratum_url").unwrap_or_default();
+        if !stratum_url.trim().is_empty() {
+            let mine_to_address = s.get_str("mine_to_address").unwrap_or_default();
+            if mine_to_address.parse::<LotusAddress>().is_err() {
+                return Err(ConfigError::Message(
+                    "stratum mode requires mine_to_address to be a valid Lotus address".to_string(),
+                ));
+            }
         }
 
         s.try_into()

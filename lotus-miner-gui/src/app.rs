@@ -21,6 +21,9 @@ pub struct UserSettings {
     bitcoind_password: String,
     rpc_poll_interval: u64,
     gpu_index: i64,
+    stratum_url: String,
+    stratum_worker_name: String,
+    stratum_password: String,
 }
 
 pub struct MinerApp {
@@ -51,6 +54,11 @@ impl MinerApp {
                 bitcoind_password: config_settings.rpc_password,
                 rpc_poll_interval: config_settings.rpc_poll_interval.try_into().unwrap(),
                 gpu_index: config_settings.gpu_index,
+                stratum_url: config_settings.stratum_url.unwrap_or_default(),
+                stratum_worker_name: config_settings.stratum_worker_name.unwrap_or_default(),
+                stratum_password: config_settings
+                    .stratum_password
+                    .unwrap_or_else(|| settings::DEFAULT_STRATUM_PASSWORD.to_string()),
             },
             Err(err) => {
                 eprintln!("Failed to load config, falling back to defaults: {}", err);
@@ -62,6 +70,9 @@ impl MinerApp {
                     bitcoind_password: settings::DEFAULT_PASSWORD.to_string(),
                     rpc_poll_interval: settings::DEFAULT_RPC_POLL_INTERVAL.try_into().unwrap(),
                     gpu_index: settings::DEFAULT_GPU_INDEX,
+                    stratum_url: String::new(),
+                    stratum_worker_name: String::new(),
+                    stratum_password: settings::DEFAULT_STRATUM_PASSWORD.to_string(),
                 }
             }
         };
@@ -73,6 +84,9 @@ impl MinerApp {
             mine_to_address: user_settings.mine_to_address.clone(),
             kernel_size: user_settings.intensity.into(),
             gpu_index: user_settings.gpu_index,
+            stratum_url: Some(user_settings.stratum_url.clone()),
+            stratum_worker_name: Some(user_settings.stratum_worker_name.clone()),
+            stratum_password: Some(user_settings.stratum_password.clone()),
         };
         MinerApp {
             user_settings,
@@ -96,7 +110,7 @@ impl epi::App for MinerApp {
 
     fn setup(
         &mut self,
-        _ctx: &egui::CtxRef, 
+        _ctx: &egui::CtxRef,
         _frame: &mut epi::Frame<'_>,
         storage: Option<&dyn epi::Storage>,
     ) {
@@ -123,135 +137,154 @@ impl epi::App for MinerApp {
         self.logs
             .append(&mut self.server.log().get_logs_and_clear());
 
-        egui::SidePanel::left("side_panel").default_width(300.0).show(ctx, |ui| {
-            ui.heading("Settings (\"Apply & Mine\" to update)");
+        egui::SidePanel::left("side_panel")
+            .default_width(300.0)
+            .show(ctx, |ui| {
+                ui.heading("Settings (\"Apply & Mine\" to update)");
 
-            egui::Grid::new("panel_grid")
-                .striped(true)
-                .spacing([40.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label("Miner address: ");
-                    ui.text_edit_singleline(&mut self.user_settings.mine_to_address);
-                    ui.end_row();
+                egui::Grid::new("panel_grid")
+                    .striped(true)
+                    .spacing([40.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Miner address: ");
+                        ui.text_edit_singleline(&mut self.user_settings.mine_to_address);
+                        ui.end_row();
 
-                    ui.label("Intensity: ");
-                    ui.add(egui::Slider::new(
-                        &mut self.user_settings.intensity,
-                        8i32..=27,
-                    ));
-                    ui.end_row();
+                        ui.label("Intensity: ");
+                        ui.add(egui::Slider::new(
+                            &mut self.user_settings.intensity,
+                            8i32..=27,
+                        ));
+                        ui.end_row();
 
-                    ui.label("RPC URL: ");
-                    ui.text_edit_singleline(&mut self.user_settings.bitcoind_url);
-                    ui.end_row();
+                        ui.label("RPC URL: ");
+                        ui.text_edit_singleline(&mut self.user_settings.bitcoind_url);
+                        ui.end_row();
 
-                    ui.label("RPC User: ");
-                    ui.text_edit_singleline(&mut self.user_settings.bitcoind_user);
-                    ui.end_row();
+                        ui.label("RPC User: ");
+                        ui.text_edit_singleline(&mut self.user_settings.bitcoind_user);
+                        ui.end_row();
 
-                    ui.label("RPC Password: ");
-                    ui.add(
-                        TextEdit::singleline(&mut self.user_settings.bitcoind_password)
-                            .password(true),
-                    );
-                    ui.end_row();
+                        ui.label("RPC Password: ");
+                        ui.add(
+                            TextEdit::singleline(&mut self.user_settings.bitcoind_password)
+                                .password(true),
+                        );
+                        ui.end_row();
 
-                    ui.label("RPC Poll Interval: ");
-                    ui.add(egui::Slider::new(
-                        &mut self.user_settings.rpc_poll_interval,
-                        1..=10,
-                    ));
-                    ui.end_row();
+                        ui.label("RPC Poll Interval: ");
+                        ui.add(egui::Slider::new(
+                            &mut self.user_settings.rpc_poll_interval,
+                            1..=10,
+                        ));
+                        ui.end_row();
 
-                    ui.label("GPU: ");
-                    egui::ComboBox::from_id_source("gpu")
-                        .selected_text(
-                            self.device_names
-                                .get(self.user_settings.gpu_index as usize)
-                                .map(String::as_str)
-                                .unwrap_or(""),
-                        )
-                        .show_ui(ui, |ui| {
-                            for (device_idx, device_name) in self.device_names.iter().enumerate() {
-                                ui.selectable_value(
-                                    &mut self.user_settings.gpu_index,
-                                    device_idx as i64,
-                                    device_name,
-                                );
-                            }
-                        });
-                    ui.end_row();
+                        ui.label("Stratum URL (host:port): ");
+                        ui.text_edit_singleline(&mut self.user_settings.stratum_url);
+                        ui.end_row();
 
-                    ui.label("");
-                    let btn_apply = Button::new("Apply & Mine")
-                        .text_color(Color32::BLACK)
-                        .fill(Color32::LIGHT_GRAY);
-                    if ui.add(btn_apply).clicked() {
-                        self._apply_settings();
-                    }
-                    ui.end_row();
+                        ui.label("Stratum Worker Name: ");
+                        ui.text_edit_singleline(&mut self.user_settings.stratum_worker_name);
+                        ui.end_row();
+
+                        ui.label("Stratum Password: ");
+                        ui.add(
+                            TextEdit::singleline(&mut self.user_settings.stratum_password)
+                                .password(true),
+                        );
+                        ui.end_row();
+
+                        ui.label("GPU: ");
+                        egui::ComboBox::from_id_source("gpu")
+                            .selected_text(
+                                self.device_names
+                                    .get(self.user_settings.gpu_index as usize)
+                                    .map(String::as_str)
+                                    .unwrap_or(""),
+                            )
+                            .show_ui(ui, |ui| {
+                                for (device_idx, device_name) in
+                                    self.device_names.iter().enumerate()
+                                {
+                                    ui.selectable_value(
+                                        &mut self.user_settings.gpu_index,
+                                        device_idx as i64,
+                                        device_name,
+                                    );
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("");
+                        let btn_apply = Button::new("Apply & Mine")
+                            .text_color(Color32::BLACK)
+                            .fill(Color32::LIGHT_GRAY);
+                        if ui.add(btn_apply).clicked() {
+                            self._apply_settings();
+                        }
+                        ui.end_row();
+                    });
+
+                let hashrate_text = match self.server.log().hashrates().last() {
+                    Some(hashrate) => hashrate.to_string(),
+                    None => "Hashrate: calculating...".to_string(),
+                };
+                ui.add(Label::new(hashrate_text).heading());
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.hashrate_zoom, HashrateZoom::T10m, "10m");
+                    ui.radio_value(&mut self.hashrate_zoom, HashrateZoom::T1h, "1h");
+                    ui.radio_value(&mut self.hashrate_zoom, HashrateZoom::T1d, "1d");
+                    ui.radio_value(&mut self.hashrate_zoom, HashrateZoom::Max, "Max");
                 });
 
-            let hashrate_text = match self.server.log().hashrates().last() {
-                Some(hashrate) => hashrate.to_string(),
-                None => "Hashrate: calculating...".to_string(),
-            };
-            ui.add(Label::new(hashrate_text).heading());
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut self.hashrate_zoom, HashrateZoom::T10m, "10m");
-                ui.radio_value(&mut self.hashrate_zoom, HashrateZoom::T1h, "1h");
-                ui.radio_value(&mut self.hashrate_zoom, HashrateZoom::T1d, "1d");
-                ui.radio_value(&mut self.hashrate_zoom, HashrateZoom::Max, "Max");
-            });
+                let (_id, rect) = ui.allocate_space(ui.available_size());
 
-            let (_id, rect) = ui.allocate_space(ui.available_size());
+                let mut shapes = vec![];
 
-            let mut shapes = vec![];
-
-            let hashrate_duration = match self.hashrate_zoom {
-                HashrateZoom::T10m => chrono::Duration::minutes(10),
-                HashrateZoom::T1h => chrono::Duration::hours(1),
-                HashrateZoom::T1d => chrono::Duration::days(1),
-                HashrateZoom::Max => chrono::Duration::max_value(),
-            };
-            let now = chrono::Local::now();
-            let mut points: Vec<(chrono::Duration, f64)> = Vec::new();
-            let mut max_age = chrono::Duration::zero();
-            let mut max_hashrate = 0.0;
-            for hashrate in self.server.log().hashrates().iter() {
-                let age = now.signed_duration_since(hashrate.timestamp);
-                if age <= hashrate_duration {
-                    points.push((age, hashrate.hashrate));
-                    if age > max_age {
-                        max_age = age;
-                    }
-                    if hashrate.hashrate > max_hashrate {
-                        max_hashrate = hashrate.hashrate;
+                let hashrate_duration = match self.hashrate_zoom {
+                    HashrateZoom::T10m => chrono::Duration::minutes(10),
+                    HashrateZoom::T1h => chrono::Duration::hours(1),
+                    HashrateZoom::T1d => chrono::Duration::days(1),
+                    HashrateZoom::Max => chrono::Duration::max_value(),
+                };
+                let now = chrono::Local::now();
+                let mut points: Vec<(chrono::Duration, f64)> = Vec::new();
+                let mut max_age = chrono::Duration::zero();
+                let mut max_hashrate = 0.0;
+                for hashrate in self.server.log().hashrates().iter() {
+                    let age = now.signed_duration_since(hashrate.timestamp);
+                    if age <= hashrate_duration {
+                        points.push((age, hashrate.hashrate));
+                        if age > max_age {
+                            max_age = age;
+                        }
+                        if hashrate.hashrate > max_hashrate {
+                            max_hashrate = hashrate.hashrate;
+                        }
                     }
                 }
-            }
-            let to_screen = RectTransform::from_to(
-                Rect::from_x_y_ranges(
-                    0.0..=max_age.num_milliseconds() as f32,
-                    max_hashrate as f32..=0.0,
-                ),
-                rect,
-            );
-            let points: Vec<Pos2> = points
-                .iter()
-                .map(|&(age, hashrate)| {
-                    let time = max_age - age;
-                    to_screen * pos2(time.num_milliseconds() as f32, hashrate as f32)
-                })
-                .collect();
-            let thickness = 2.0;
-            shapes.push(Shape::line(
-                points,
-                Stroke::new(thickness, Color32::from_additive_luminance(196)),
-            ));
+                let to_screen = RectTransform::from_to(
+                    Rect::from_x_y_ranges(
+                        0.0..=max_age.num_milliseconds() as f32,
+                        max_hashrate as f32..=0.0,
+                    ),
+                    rect,
+                );
+                let points: Vec<Pos2> = points
+                    .iter()
+                    .map(|&(age, hashrate)| {
+                        let time = max_age - age;
+                        to_screen * pos2(time.num_milliseconds() as f32, hashrate as f32)
+                    })
+                    .collect();
+                let thickness = 2.0;
+                shapes.push(Shape::line(
+                    points,
+                    Stroke::new(thickness, Color32::from_additive_luminance(196)),
+                ));
 
-            ui.painter().extend(shapes);
-        });
+                ui.painter().extend(shapes);
+            });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Logs");
@@ -289,6 +322,23 @@ impl MinerApp {
             node_settings.bitcoind_password = user_settings.bitcoind_password;
             node_settings.rpc_poll_interval = user_settings.rpc_poll_interval;
             node_settings.miner_addr = user_settings.mine_to_address;
+            drop(node_settings);
+
+            let mut stratum_settings = server.stratum_settings().await;
+            stratum_settings.stratum_url = if user_settings.stratum_url.trim().is_empty() {
+                None
+            } else {
+                Some(user_settings.stratum_url)
+            };
+            stratum_settings.stratum_worker_name =
+                if user_settings.stratum_worker_name.trim().is_empty() {
+                    None
+                } else {
+                    Some(user_settings.stratum_worker_name)
+                };
+            stratum_settings.stratum_password = user_settings.stratum_password;
+            drop(stratum_settings);
+
             let mut miner = server.miner();
             miner.set_intensity(user_settings.intensity);
             let result = miner.update_gpu_index(user_settings.gpu_index);

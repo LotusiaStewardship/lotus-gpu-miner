@@ -25,6 +25,7 @@ pub struct BackendMiner {
     header_buffer: Buffer,
     output_buffer: Buffer,
     offset_buffer: Buffer,
+    target_buffer: Buffer,
 }
 
 impl BackendMiner {
@@ -73,12 +74,16 @@ impl BackendMiner {
         // offset_buffer: 1 u32 (4 bytes)
         let offset_buffer = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
 
+        // target_buffer: 8 u32s (32 bytes) for target
+        let target_buffer = device.new_buffer(32, MTLResourceOptions::StorageModeShared);
+
         Ok(BackendMiner {
             command_queue,
             pipeline_state,
             header_buffer,
             output_buffer,
             offset_buffer,
+            target_buffer,
         })
     }
 
@@ -124,6 +129,15 @@ impl BackendMiner {
             std::ptr::write(self.offset_buffer.contents() as *mut u32, base);
         }
 
+        // Write target to buffer (already in little-endian format)
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                work.target.as_ptr() as *const _,
+                self.target_buffer.contents() as *mut _,
+                32,
+            );
+        }
+
         // Clear output buffer
         unsafe {
             std::ptr::write_bytes(self.output_buffer.contents() as *mut u8, 0, 1024);
@@ -136,6 +150,7 @@ impl BackendMiner {
         encoder.set_buffer(0, Some(&self.offset_buffer), 0);
         encoder.set_buffer(1, Some(&self.header_buffer), 0);
         encoder.set_buffer(2, Some(&self.output_buffer), 0);
+        encoder.set_buffer(3, Some(&self.target_buffer), 0);
 
         // Dispatch compute kernel
         let kernel_size = settings.kernel_size as u64;
@@ -160,17 +175,12 @@ impl BackendMiner {
                     let hash = crate::sha256::lotus_hash(&header);
                     let mut candidate_hash = hash;
                     candidate_hash.reverse();
-                    log.info(format!(
-                        "Candidate: nonce={}, hash={}",
-                        result_nonce,
-                        hex::encode(&candidate_hash)
-                    ));
-                    if hash.last() != Some(&0) {
+                    /* if hash.last() != Some(&0) {
                         log.bug(
                             "BUG: found nonce's hash has no leading zero byte. Contact the \
                                    developers.",
                         );
-                    }
+                    } */
                     let mut below_or_equal_target = true;
                     for (&h, &t) in hash.iter().zip(work.target.iter()).rev() {
                         if h > t {
@@ -182,6 +192,11 @@ impl BackendMiner {
                         }
                     }
                     if below_or_equal_target {
+                        log.info(format!(
+                            "Candidate: nonce={}, hash={}",
+                            result_nonce,
+                            hex::encode(&candidate_hash)
+                        ));
                         return Ok(Some(result_nonce));
                     }
                 }

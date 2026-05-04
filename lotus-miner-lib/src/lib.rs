@@ -19,9 +19,7 @@ use std::{
 };
 
 use bitcoinsuite_bitcoind_stratum::{build_stratum_header, difficulty_to_target};
-use bitcoinsuite_core::{
-    LotusAddress,
-};
+use bitcoinsuite_core::LotusAddress;
 use block::{create_block, Block, GetRawUnsolvedBlockResponse};
 use miner::{MiningSettings, Work};
 use rand::{Rng, SeedableRng};
@@ -202,21 +200,22 @@ fn parse_notify_params(params: &[Value]) -> Result<ParsedNotify> {
         .ok_or_else(|| eyre::eyre!("invalid clean_jobs in mining.notify"))?;
 
     // Parse Lotus-specific extensions (optional, default to 0/zero-hash for backward compat)
-    let block_height = params.get(9)
+    let block_height = params
+        .get(9)
         .and_then(|v| v.as_i64())
         .map(|v| v as i32)
         .unwrap_or(0);
-    let epoch_hash_hex = params.get(10)
+    let epoch_hash_hex = params
+        .get(10)
         .and_then(|v| v.as_str())
         .unwrap_or("0000000000000000000000000000000000000000000000000000000000000000")
         .to_string();
-    let extended_metadata_hash_hex = params.get(11)
+    let extended_metadata_hash_hex = params
+        .get(11)
         .and_then(|v| v.as_str())
         .unwrap_or("0000000000000000000000000000000000000000000000000000000000000000")
         .to_string();
-    let block_size = params.get(12)
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let block_size = params.get(12).and_then(|v| v.as_u64()).unwrap_or(0);
 
     Ok(ParsedNotify {
         job_id,
@@ -561,8 +560,7 @@ async fn handle_stratum_line(
                     .and_then(|p| p.as_array())
                     .and_then(|a| a.first())
                     .and_then(|d| d.as_f64())
-                    .unwrap_or(1.0)
-                    .max(0.0000001);
+                    .unwrap_or(16.0);
                 server.stratum_settings.lock().await.stratum_difficulty = diff;
                 server.log().info(format!("set_difficulty={}", diff));
             }

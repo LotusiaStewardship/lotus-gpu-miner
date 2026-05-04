@@ -65,6 +65,26 @@ constant uint NFLAG = 0x7F;
 constant uint ITERATIONS = 16;
 
 // ============================================================================
+// Target Comparison Function
+// ============================================================================
+
+// Check if hash <= target (both in little-endian, 8 x uint32)
+// Returns true if hash is below or equal to target
+bool hash_meets_target(const thread metal::uint *hash, const device metal::uint *target) {
+    // Compare from most significant word (index 7) to least significant (index 0)
+    for (int i = 7; i >= 0; --i) {
+        if (hash[i] > target[i]) {
+            return false;  // hash > target
+        }
+        if (hash[i] < target[i]) {
+            return true;  // hash < target
+        }
+        // hash[i] == target[i]: undecided, continue to next word
+    }
+    return true;  // hash == target
+}
+
+// ============================================================================
 // SHA256 Helper Functions
 // ============================================================================
 
@@ -203,6 +223,7 @@ kernel void search(
     const device uint& offset [[buffer(0)]],
     const device uint* partial_header [[buffer(1)]],
     device uint* output [[buffer(2)]],
+    const device uint* target [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
     metal::uint pow_layer[16];
@@ -237,7 +258,7 @@ kernel void search(
         
         sha256_chain_layer(chain_input, hash);
         
-        if (hash[7] == 0) {
+        if (hash_meets_target(hash, target)) {
             device atomic_uint* found_ptr = reinterpret_cast<device atomic_uint*>(&output[FOUND]);
             device atomic_uint* nonce_ptr = reinterpret_cast<device atomic_uint*>(&output[nonce & NFLAG]);
             atomic_fetch_add_explicit(found_ptr, 1u, memory_order_relaxed);

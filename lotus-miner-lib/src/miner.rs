@@ -83,7 +83,9 @@ impl Miner {
     }
 
     pub fn find_nonce(&mut self, work: &Work, log: &Log) -> Result<Option<u64>> {
-        self.backend.find_nonce(&self.settings, work, log).map_err(|e| eyre::eyre!("{}", e))
+        self.backend
+            .find_nonce(&self.settings, work, log)
+            .map_err(|e| eyre::eyre!("{}", e))
     }
 
     pub fn set_intensity(&mut self, intensity: i32) {

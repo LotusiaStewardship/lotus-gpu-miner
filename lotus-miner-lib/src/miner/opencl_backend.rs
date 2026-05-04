@@ -25,6 +25,7 @@ pub struct BackendMiner {
     search_kernel: Kernel,
     header_buffer: Buffer<u32>,
     buffer: Buffer<u32>,
+    target_buffer: Buffer<u32>,
 }
 
 impl BackendMiner {
@@ -39,10 +40,18 @@ impl BackendMiner {
         println!("[OpenCL] Platform: OpenCL");
         println!("[OpenCL] Kernel: {}", kernel_file);
         for (platform_idx, platform) in platforms.iter().enumerate() {
-            println!("[OpenCL] Platform {}: {}", platform_idx, platform.name().unwrap_or("<invalid platform>".to_string()));
+            println!(
+                "[OpenCL] Platform {}: {}",
+                platform_idx,
+                platform.name().unwrap_or("<invalid platform>".to_string())
+            );
             let devices = Device::list_all(platform).map_err(MinerError::Ocl)?;
             for (device_idx, device) in devices.iter().enumerate() {
-                println!("- device {}: {}", device_idx, device.name().map_err(MinerError::Ocl)?);
+                println!(
+                    "- device {}: {}",
+                    device_idx,
+                    device.name().map_err(MinerError::Ocl)?
+                );
             }
         }
         let mut platform_device = None;
@@ -78,19 +87,31 @@ impl BackendMiner {
             .map_err(MinerError::Ocl)?;
         let header_buffer = Buffer::builder()
             .len(0xff)
-            .queue(queue)
+            .queue(queue.clone())
             .build()
             .map_err(MinerError::Ocl)?;
+        let target_buffer = Buffer::builder()
+            .len(8)
+            .queue(queue.clone())
+            .build()
+            .map_err(MinerError::Ocl)?;
+        let mut kernel_builder = Kernel::builder();
+        kernel_builder
+            .program(&program)
+            .name("search")
+            .queue(queue.clone());
         let search_kernel = kernel_builder
             .arg_named("offset", 0u32)
             .arg_named("partial_header", None::<&Buffer<u32>>)
             .arg_named("output", None::<&Buffer<u32>>)
+            .arg_named("target", None::<&Buffer<u32>>)
             .build()
             .map_err(MinerError::Ocl)?;
         Ok(BackendMiner {
             search_kernel,
             buffer,
             header_buffer,
+            target_buffer,
         })
     }
 
@@ -128,7 +149,20 @@ impl BackendMiner {
         self.search_kernel
             .set_arg("output", &self.buffer)
             .map_err(MinerError::Ocl)?;
-        self.search_kernel.set_arg("offset", base).map_err(MinerError::Ocl)?;
+        self.search_kernel
+            .set_arg("offset", base)
+            .map_err(MinerError::Ocl)?;
+
+        // Write target to buffer (convert to u32 array for OpenCL)
+        let target_u32: [u32; 8] = unsafe { std::mem::transmute_copy(&work.target) };
+        self.target_buffer
+            .write(&target_u32[..])
+            .enq()
+            .map_err(MinerError::Ocl)?;
+        self.search_kernel
+            .set_arg("target", &self.target_buffer)
+            .map_err(MinerError::Ocl)?;
+
         let mut vec = vec![0; self.buffer.len()];
         self.buffer.write(&vec).enq().map_err(MinerError::Ocl)?;
         let cmd = self
@@ -149,17 +183,12 @@ impl BackendMiner {
                     let hash = crate::sha256::lotus_hash(&header);
                     let mut candidate_hash = hash;
                     candidate_hash.reverse();
-                    log.info(format!(
-                        "Candidate: nonce={}, hash={}",
-                        result_nonce,
-                        hex::encode(&candidate_hash)
-                    ));
-                    if hash.last() != Some(&0) {
+                    /* if hash.last() != Some(&0) {
                         log.bug(
                             "BUG: found nonce's hash has no leading zero byte. Contact the \
                                    developers.",
                         );
-                    }
+                    } */
                     let mut below_or_equal_target = true;
                     for (&h, &t) in hash.iter().zip(work.target.iter()).rev() {
                         if h > t {
@@ -171,6 +200,11 @@ impl BackendMiner {
                         }
                     }
                     if below_or_equal_target {
+                        log.info(format!(
+                            "Candidate: nonce={}, hash={}",
+                            result_nonce,
+                            hex::encode(&candidate_hash)
+                        ));
                         return Ok(Some(result_nonce));
                     }
                 }

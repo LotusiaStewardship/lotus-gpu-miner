@@ -36,6 +36,21 @@ __constant uint CHAIN_LAYER_SCHEDULE_ARRAY[64] = {
 #define rot(x, y) rotate((num_t)x, (num_t)y)
 #define rotr(x, y) rotate((num_t)x, (num_t)(32-y))
 
+// Check if hash <= target (both as 256-bit numbers, big-endian comparison)
+// Returns 1 (true) if hash is below or equal to target
+uint hash_meets_target(__private num_t *hash, __constant num_t *target) {
+    // Compare from most significant word (index 7) to least significant (index 0)
+    for (int i = 7; i >= 0; --i) {
+        if (hash[i] > target[i]) {
+            return 0;  // hash > target
+        }
+        if (hash[i] < target[i]) {
+            return 1;  // hash < target
+        }
+    }
+    return 1;  // hash == target
+}
+
 num_t sigma0(num_t a) {
     return rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
 }
@@ -134,7 +149,8 @@ void sha256_chain_layer(
 __kernel void search(
     const uint offset,
     __global uint *partial_header,
-    __global uint *output
+    __global uint *output,
+    __constant uint *target
 ) {
     num_t pow_layer[64];
     num_t chain_layer[64];
@@ -156,7 +172,7 @@ __kernel void search(
         sha256_pow_layer(pow_layer, &chain_layer[8]);
         sha256_chain_layer(chain_layer, hash);
         
-        if (hash[7] == 0) {
+        if (hash_meets_target(hash, target)) {
             output[FOUND] = 1;
             output[NFLAG & nonce] = nonce;
         }

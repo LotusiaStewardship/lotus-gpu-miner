@@ -87,6 +87,7 @@ impl MinerApp {
             stratum_url: Some(user_settings.stratum_url.clone()),
             stratum_worker_name: Some(user_settings.stratum_worker_name.clone()),
             stratum_password: Some(user_settings.stratum_password.clone()),
+            no_color: false,
         };
         MinerApp {
             user_settings,

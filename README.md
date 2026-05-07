@@ -10,7 +10,9 @@ A high-performance GPU mining software for the [Lotus Network](https://lotusia.o
   - **Stratum Mode**: Connect to a stratum pool server for pooled mining
 - **Cross-Platform**: Works on Windows, macOS, and Linux
 - **CLI and GUI**: Command-line interface for advanced users, graphical interface for ease of use
-- **Real-time Metrics**: Live hashrate monitoring and logging
+- **Real-time Metrics**: Live hashrate monitoring with colored logging
+- **Enhanced Logging**: Categorized log output (status, work, shares, hashrate, blocks) with optional colors
+- **Share Tracking**: Sequential share counters, latency tracking, rejection reasons, and running totals
 - **Configurable**: Extensive configuration options for kernel size, GPU selection, and mining parameters
 
 ## Project Structure
@@ -123,6 +125,9 @@ kernel_size = 23        # Mining intensity (higher = more GPU usage)
 stratum_url = ""        # Leave empty for RPC mode, or "pool.example.com:3333" for stratum
 stratum_worker_name = ""
 stratum_password = "x"
+
+# Logging
+color = true            # Set to false to disable colored output
 ```
 
 ### Command-Line Options
@@ -142,6 +147,7 @@ OPTIONS:
         --stratum-url <url>                Stratum server host:port (enables stratum mode)
         --stratum-worker-name <name>       Worker name suffix
         --stratum-password <password>      Stratum password
+        --no-color                         Disable colored output in logs
 ```
 
 ## Usage
@@ -232,16 +238,57 @@ Currently, the miner supports one GPU at a time. For multi-GPU setups, run multi
 
 ### Hashrate Reporting
 
-The miner reports hashrate every 10 seconds by default. Example output:
+The miner reports hashrate every 10 seconds by default in the main log stream:
 ```
-2026-05-02T05:56:52.468386-07:00 Hashrate 231.921 MH/s
+[14:25:00] [HASHRATE] 2.34 MH/s
 ```
 
 ### Logs
 
-Mining logs are accessible via:
-- **CLI**: Printed to stdout with severity levels (Info, Warn, Error)
-- **GUI**: Displayed in the logs panel with color coding
+**CLI Logging:**
+
+Logs are printed to stdout with colored, categorized output. Each log entry includes:
+- Timestamp (HH:MM:SS format)
+- Category label (STATUS, WORK, DIFF, SHARE ✓, SHARE ✗, SHARE !, HASHRATE, BLOCK, WARN, ERROR)
+- Descriptive message
+
+Color categories:
+- **Cyan (STATUS)**: Connection and session state
+- **White (WORK)**: Job updates
+- **Magenta (DIFF)**: Difficulty changes  
+- **Green (SHARE ✓)**: Accepted shares
+- **Yellow (SHARE ✗)**: Rejected shares
+- **Red (SHARE !)**: Errored shares
+- **Blue (HASHRATE)**: Hashrate reports
+- **Bright Green (BLOCK)**: Block found
+- **Yellow (WARN)**: Warnings
+- **Red (ERROR)**: Errors
+
+Disable colors with `--no-color` CLI flag or `no_color = false` in config.
+
+**Stratum Share Tracking:**
+
+In stratum mode, shares are tracked with:
+- Sequential counter (#1, #2, #3...)
+- Visual indicators (✓ accepted, ✗ rejected, ! errored)
+- Latency in milliseconds
+- Running totals (e.g., "total: 142✓ / 3✗ / 1!")
+- Rejection reason extraction (low_difficulty, stale_job, duplicate_share)
+
+Example stratum output:
+```
+[14:20:00] [STATUS] Connecting to pool: stratum+tcp://pool.example.com:3333
+[14:20:01] [STATUS] Subscribed ✓ | extranonce2_size: 4
+[14:20:02] [STATUS] Authorized ✓ | worker: lotus_16PSJNf...miner1
+[14:20:05] [WORK] New job #4a2f height:123456 | clean: yes
+[14:20:18] [SHARE ✓] #1 accepted | job:4a2f | 38ms | total: 1✓ / 0✗ / 0!
+[14:20:45] [SHARE ✗] #2 rejected | job:4a2f | 42ms | total: 1✓ / 1✗ / 0!
+[14:25:00] [HASHRATE] 2.34 MH/s
+```
+
+**GUI Logging:**
+
+The GUI displays logs in a scrollable panel with the same color coding and categories.
 
 ## Troubleshooting
 
@@ -252,8 +299,12 @@ Mining logs are accessible via:
 - Check that your GPU is detected: `clinfo` (Linux) or GPU-Z (Windows)
 
 **"GPU not found"**
-- Verify GPU index with the platform listing at startup
+- Verify GPU index with the device listing at startup (format: `[platformIdx][deviceIdx] Platform - Device`)
 - Try different `gpu_index` values
+
+**Colors not displaying correctly**
+- Some terminals don't support ANSI colors
+- Use `--no-color` CLI flag or set `no_color = true` in config
 
 **Low hashrate**
 - Increase `kernel_size` gradually

@@ -37,21 +37,17 @@ impl BackendMiner {
             .cmplr_def("WORKSIZE", settings.local_work_size)
             .cmplr_def("ITERATIONS", settings.inner_iter_size);
         let platforms = Platform::list();
-        println!("[OpenCL] Platform: OpenCL");
-        println!("[OpenCL] Kernel: {}", kernel_file);
+        println!("[GPU] Backend: OpenCL");
+        println!("[GPU] Kernel: {}", kernel_file);
+        println!("[GPU] Available devices:");
+        let mut global_device_idx = 0;
         for (platform_idx, platform) in platforms.iter().enumerate() {
-            println!(
-                "[OpenCL] Platform {}: {}",
-                platform_idx,
-                platform.name().unwrap_or("<invalid platform>".to_string())
-            );
+            let platform_name = platform.name().unwrap_or_else(|_| "<invalid platform>".to_string());
             let devices = Device::list_all(platform).map_err(MinerError::Ocl)?;
             for (device_idx, device) in devices.iter().enumerate() {
-                println!(
-                    "- device {}: {}",
-                    device_idx,
-                    device.name().map_err(MinerError::Ocl)?
-                );
+                let device_name = device.name().map_err(MinerError::Ocl)?;
+                println!("  [{}{}] {}: {}", platform_idx, device_idx, platform_name, device_name);
+                global_device_idx += 1;
             }
         }
         let mut platform_device = None;
@@ -200,7 +196,7 @@ impl BackendMiner {
                         }
                     }
                     if below_or_equal_target {
-                        log.info(format!(
+                        log.debug(format!(
                             "Candidate: nonce={}, hash={}",
                             result_nonce,
                             hex::encode(&candidate_hash)
@@ -216,15 +212,17 @@ impl BackendMiner {
     pub fn list_device_names() -> Vec<String> {
         let platforms = Platform::list();
         let mut device_names = Vec::new();
-        for platform in platforms.iter() {
-            let platform_name = platform.name().unwrap_or("<invalid platform>".to_string());
+        let mut global_idx = 0;
+        for (platform_idx, platform) in platforms.iter().enumerate() {
+            let platform_name = platform.name().unwrap_or_else(|_| "<invalid platform>".to_string());
             let devices = Device::list_all(platform).unwrap_or(vec![]);
-            for device in devices.iter() {
+            for (device_idx, device) in devices.iter().enumerate() {
+                let device_name = device.name().unwrap_or_else(|_| "<invalid device>".to_string());
                 device_names.push(format!(
-                    "{} - {}",
-                    platform_name,
-                    device.name().unwrap_or("<invalid device>".to_string())
+                    "[{}{}] {} - {}",
+                    platform_idx, device_idx, platform_name, device_name
                 ));
+                global_idx += 1;
             }
         }
         device_names

@@ -26,6 +26,7 @@ pub struct ConfigSettings {
     pub stratum_url: Option<String>,
     pub stratum_worker_name: Option<String>,
     pub stratum_password: Option<String>,
+    pub no_color: bool,
 }
 
 const DEFAULT_CONFIG_FILE_CONTENT: &str = r#"mine_to_address = ""
@@ -39,6 +40,8 @@ kernel_size = 23
 stratum_url = ""
 stratum_worker_name = ""
 stratum_password = "x"
+# Disable colored output
+no_color = false
 "#;
 
 impl ConfigSettings {
@@ -65,6 +68,7 @@ impl ConfigSettings {
         s.set_default("stratum_url", "")?;
         s.set_default("stratum_worker_name", "")?;
         s.set_default("stratum_password", DEFAULT_STRATUM_PASSWORD)?;
+        s.set_default("no_color", false)?;
 
         // Load config from file
         let default_config = home_dir;
@@ -166,6 +170,9 @@ impl ConfigSettings {
         }
         if let Some(stratum_password) = matches.value_of("stratum_password") {
             s.set("stratum_password", stratum_password)?;
+        }
+        if matches.is_present("no_color") {
+            s.set("no_color", true)?;
         }
 
         let stratum_url = s.get_str("stratum_url").unwrap_or_default();

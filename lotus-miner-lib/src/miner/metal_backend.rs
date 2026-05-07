@@ -39,9 +39,9 @@ impl BackendMiner {
             .ok_or_else(|| MinerError::Other(format!("No Metal device at index {}", device_idx)))?;
 
         let device_name = device.name();
-        println!("[Metal] Platform: macOS Metal");
-        println!("[Metal] Device #{}: {}", device_idx, device_name);
-        println!("[Metal] Kernel: kernels/lotus_macos.metal");
+        println!("[GPU] Backend: macOS Metal");
+        println!("[GPU] Device #{}: {}", device_idx, device_name);
+        println!("[GPU] Kernel: kernels/lotus_macos.metal");
 
         // Create command queue
         let command_queue = device.new_command_queue();
@@ -192,7 +192,7 @@ impl BackendMiner {
                         }
                     }
                     if below_or_equal_target {
-                        log.info(format!(
+                        log.debug(format!(
                             "Candidate: nonce={}, hash={}",
                             result_nonce,
                             hex::encode(&candidate_hash)
@@ -211,7 +211,7 @@ impl BackendMiner {
         devices
             .iter()
             .enumerate()
-            .map(|(_i, dev)| format!("Metal - {}", dev.name()))
+            .map(|(i, dev)| format!("[{}] macOS Metal - {}", i, dev.name()))
             .collect()
     }
 

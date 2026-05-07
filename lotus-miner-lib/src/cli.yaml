@@ -52,3 +52,6 @@ args:
                   long: stratum-password
                   help: Stratum password (typically x)
                   takes_value: true
+        - no_color:
+                  long: no-color
+                  help: Disable colored output in logs

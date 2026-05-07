@@ -3,6 +3,7 @@ mod miner;
 pub mod settings;
 mod sha256;
 
+use colored::Colorize;
 use eyre::Result;
 pub use miner::Miner;
 pub use settings::ConfigSettings;
@@ -62,9 +63,26 @@ pub struct StratumSettings {
     pub stratum_difficulty: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogStyle {
+    Status,      // Cyan - connection/session state
+    Work,        // White - job updates
+    Difficulty,  // Magenta - difficulty changes
+    ShareAccepted,   // Green
+    ShareRejected, // Yellow
+    ShareErrored,  // Red
+    Hashrate,    // Blue
+    Block,       // Bright Green + Bold
+    Warn,        // Yellow
+    Error,       // Red
+    Bug,         // Bright Red
+    Debug,       // Gray
+}
+
 pub struct Log {
     logs: std::sync::RwLock<Vec<LogEntry>>,
     hashrates: std::sync::RwLock<Vec<HashrateEntry>>,
+    no_color: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +97,7 @@ pub struct LogEntry {
     pub msg: String,
     pub severity: LogSeverity,
     pub timestamp: chrono::DateTime<chrono::Local>,
+    pub style: LogStyle,
 }
 
 pub struct HashrateEntry {
@@ -122,6 +141,7 @@ struct StratumShareStats {
     accepted: u64,
     rejected: u64,
     errored: u64,
+    total_submitted: u64,
 }
 
 #[derive(Debug, Default)]
@@ -299,7 +319,7 @@ impl Server {
             rng: Mutex::new(rand::rngs::StdRng::from_entropy()),
             metrics_timestamp: Mutex::new(SystemTime::now()),
             metrics_nonces: AtomicU64::new(0),
-            log: Log::new(),
+            log: Log::new(config.no_color),
             report_hashrate_interval,
         }
     }
@@ -403,23 +423,23 @@ async fn run_stratum(server: ServerRef) -> Result<(), Box<dyn std::error::Error>
             .ok_or_else(|| eyre::eyre!("stratum_url is not set"))?;
         server
             .log()
-            .info(format!("Connecting to stratum {}", stratum_url));
+            .status(format!("Connecting to pool: {}", stratum_url));
 
         match run_stratum_session(Arc::clone(&server), &stratum_url).await {
             Ok(()) => {
                 backoff_secs = 1;
-                server.log().warn("Stratum session ended, reconnecting");
+                server.log().warn("Pool connection lost, reconnecting");
             }
             Err(err) => {
                 server
                     .log()
-                    .error(format!("Stratum session error: {}", err));
+                    .error(format!("Session error: {}", err));
             }
         }
 
         server
             .log()
-            .warn(format!("Retrying stratum in {}s", backoff_secs));
+            .status(format!("Reconnecting in {}s", backoff_secs));
         tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(60);
     }
@@ -434,6 +454,7 @@ async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()>
     let mut pending: HashMap<u64, PendingRequestKind> = HashMap::new();
     let mut share_stats = StratumShareStats::default();
     let mut handshake = StratumHandshakeState::default();
+    let mut share_timestamps: HashMap<u64, std::time::Instant> = HashMap::new();
 
     let worker_name = server.stratum_worker_full_name().await?;
     let stratum_password = server
@@ -454,8 +475,7 @@ async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()>
     writer_half
         .write_all(format!("{}\n", subscribe).as_bytes())
         .await?;
-    server.log().info("Sent mining.subscribe");
-    server.log().info("Subscribed; awaiting mining.notify work");
+    server.log().debug("Sent mining.subscribe");
 
     let mut authorize_sent = false;
     let mut last_outbound = std::time::Instant::now();
@@ -476,6 +496,8 @@ async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()>
                     &mut pending,
                     &mut share_stats,
                     &mut handshake,
+                    &mut share_timestamps,
+                    &worker_name,
                 )
                 .await?;
                 if handshake.subscribed && !authorize_sent {
@@ -492,7 +514,7 @@ async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()>
                         .await?;
                     authorize_sent = true;
                     last_outbound = std::time::Instant::now();
-                    server.log().info("Sent mining.authorize");
+                    server.log().debug("Sent mining.authorize");
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(5)) => {
@@ -520,8 +542,9 @@ async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()>
                             ntime_hex_6b: ntime,
                             nonce_hex_8b: nonce_hex,
                         });
+                        share_timestamps.insert(submit_id, std::time::Instant::now());
+                        share_stats.total_submitted += 1;
                         last_outbound = std::time::Instant::now();
-                        server.log().info(format!("Sent mining.submit id={}", submit_id));
                     } else if last_outbound.elapsed() >= Duration::from_secs(30) {
                         let ping_id = req_id;
                         req_id += 1;
@@ -535,7 +558,7 @@ async fn run_stratum_session(server: ServerRef, stratum_url: &str) -> Result<()>
                             .await?;
                         pending.insert(ping_id, PendingRequestKind::Ping);
                         last_outbound = std::time::Instant::now();
-                        server.log().info(format!("Sent mining.ping id={}", ping_id));
+                        server.log().debug(format!("Sent mining.ping id={}", ping_id));
                     }
                 }
             }
@@ -549,6 +572,8 @@ async fn handle_stratum_line(
     pending: &mut HashMap<u64, PendingRequestKind>,
     share_stats: &mut StratumShareStats,
     handshake: &mut StratumHandshakeState,
+    share_timestamps: &mut HashMap<u64, std::time::Instant>,
+    worker_name: &str,
 ) -> Result<()> {
     let v: Value = serde_json::from_str(line)?;
 
@@ -560,9 +585,9 @@ async fn handle_stratum_line(
                     .and_then(|p| p.as_array())
                     .and_then(|a| a.first())
                     .and_then(|d| d.as_f64())
-                    .unwrap_or(16.0);
+                    .unwrap();
                 server.stratum_settings.lock().await.stratum_difficulty = diff;
-                server.log().info(format!("set_difficulty={}", diff));
+                server.log().difficulty(format!("Difficulty set: {}", diff));
             }
             "mining.set_extranonce" => {
                 let params = v
@@ -584,8 +609,8 @@ async fn handle_stratum_line(
                 let mut settings = server.stratum_settings.lock().await;
                 settings.stratum_extranonce1 = extranonce1.clone();
                 settings.stratum_extranonce2_size = extranonce2_size;
-                server.log().info(format!(
-                    "set_extranonce extranonce1={} extranonce2_size={}",
+                server.log().debug(format!(
+                    "set_extranonce: extranonce1={} size={}",
                     extranonce1, extranonce2_size
                 ));
             }
@@ -594,7 +619,7 @@ async fn handle_stratum_line(
                     return Err(eyre::eyre!("received mining.notify before subscribe"));
                 }
                 if !handshake.authorized {
-                    server.log().info("received mining.notify before authorize; queueing work until session is authorized");
+                    server.log().debug("received mining.notify before authorize; queueing");
                 }
                 let params = v
                     .get("params")
@@ -641,18 +666,24 @@ async fn handle_stratum_line(
                 }
                 let parsed_job_id = parsed.job_id.clone();
                 let parsed_clean_jobs = parsed.clean_jobs;
+                let parsed_block_height = parsed.block_height;
                 block_state.stratum_job = Some(StratumJob {
                     job_id: parsed_job_id.clone(),
                     ntime_hex_6b: parsed.ntime_hex_6b.clone(),
-                    notify: parsed,
+                    notify: parsed.clone(),
                     share_target_le,
                     extranonce2_counter: 0,
                     extranonce2_size,
                 });
                 drop(block_state);
-                server.log().info(format!(
-                    "Work update: mining.notify job_id={} clean_jobs={}",
-                    parsed_job_id, parsed_clean_jobs
+                let clean_str = if parsed_clean_jobs { "yes" } else { "no" };
+                let height_str = if parsed_block_height > 0 {
+                    format!(" height:{}", parsed_block_height)
+                } else {
+                    String::new()
+                };
+                server.log().work(format!(
+                    "New job #{}{} | clean: {}", parsed_job_id, height_str, clean_str
                 ));
             }
             _ => {}
@@ -686,10 +717,7 @@ async fn handle_stratum_line(
             settings.stratum_extranonce1 = extranonce1;
             settings.stratum_extranonce2_size = extranonce2_size;
             handshake.subscribed = true;
-            server.log().info(format!(
-                "mining.subscribe OK extranonce2_size={}",
-                extranonce2_size
-            ));
+            server.log().status(format!("Subscribed ✓ | extranonce2_size: {}", extranonce2_size));
         }
         Some(PendingRequestKind::Authorize) => {
             if err.is_some() && !err.is_none_or(|e| e.is_null()) {
@@ -698,64 +726,61 @@ async fn handle_stratum_line(
             let ok = v.get("result").and_then(|r| r.as_bool()).unwrap_or(false);
             if ok {
                 handshake.authorized = true;
-                server.log().info("mining.authorize OK");
+                server.log().status(format!("Authorized ✓ | worker: {}", worker_name));
             } else {
                 return Err(eyre::eyre!("mining.authorize rejected by server"));
             }
         }
         Some(PendingRequestKind::Submit {
             job_id,
-            extranonce2,
-            ntime_hex_6b,
-            nonce_hex_8b,
+            extranonce2: _,
+            ntime_hex_6b: _,
+            nonce_hex_8b: _,
         }) => {
+            let share_num = share_stats.total_submitted;
+            let latency_ms = share_timestamps
+                .remove(&id)
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+
             if err.is_some() && !err.is_none_or(|e| e.is_null()) {
                 share_stats.errored += 1;
-                server.log().warn(format!(
-                    "Share errored id={} job_id={} extranonce2={} ntime={} nonce={} error={} (a/r/e={}/{}/{})",
-                    id,
-                    job_id,
-                    extranonce2,
-                    ntime_hex_6b,
-                    nonce_hex_8b,
-                    err.unwrap(),
-                    share_stats.accepted,
-                    share_stats.rejected,
-                    share_stats.errored
+                let err_msg = err.unwrap().to_string();
+                let reason = if err_msg.contains("Low difficulty") { "low_difficulty"
+                    } else if err_msg.contains("stale") { "stale_job"
+                    } else if err_msg.contains("duplicate") { "duplicate_share"
+                    } else { "unknown" };
+                let totals = format!("total: {}✓ / {}✗ / {}!",
+                    share_stats.accepted, share_stats.rejected, share_stats.errored);
+                server.log().share_errored(format!(
+                    "#{} errored | job:{} | reason:{} | {}ms | {}",
+                    share_num, job_id, reason, latency_ms, totals
                 ));
             } else if let Some(result_bool) = v.get("result").and_then(|r| r.as_bool()) {
                 if result_bool {
                     share_stats.accepted += 1;
-                    server.log().info(format!(
-                        "Share accepted id={} job_id={} extranonce2={} ntime={} nonce={} (a/r/e={}/{}/{})",
-                        id,
-                        job_id,
-                        extranonce2,
-                        ntime_hex_6b,
-                        nonce_hex_8b,
-                        share_stats.accepted,
-                        share_stats.rejected,
-                        share_stats.errored
+                    let totals = format!("total: {}✓ / {}✗ / {}!",
+                        share_stats.accepted, share_stats.rejected, share_stats.errored);
+                    server.log().share_accepted(format!(
+                        "#{} accepted | job:{} | {}ms | {}",
+                        share_num, job_id, latency_ms, totals
                     ));
                 } else {
                     share_stats.rejected += 1;
-                    server.log().warn(format!(
-                        "Share rejected id={} job_id={} extranonce2={} ntime={} nonce={} (a/r/e={}/{}/{})",
-                        id,
-                        job_id,
-                        extranonce2,
-                        ntime_hex_6b,
-                        nonce_hex_8b,
-                        share_stats.accepted,
-                        share_stats.rejected,
-                        share_stats.errored
+                    let totals = format!("total: {}✓ / {}✗ / {}!",
+                        share_stats.accepted, share_stats.rejected, share_stats.errored);
+                    server.log().share_rejected(format!(
+                        "#{} rejected | job:{} | {}ms | {}",
+                        share_num, job_id, latency_ms, totals
                     ));
                 }
             } else {
                 share_stats.errored += 1;
-                server.log().warn(format!(
-                    "Share response missing boolean result id={} job_id={} (a/r/e={}/{}/{})",
-                    id, job_id, share_stats.accepted, share_stats.rejected, share_stats.errored
+                let totals = format!("total: {}✓ / {}✗ / {}!",
+                    share_stats.accepted, share_stats.rejected, share_stats.errored);
+                server.log().share_errored(format!(
+                    "#{} invalid_response | job:{} | {}ms | {}",
+                    share_num, job_id, latency_ms, totals
                 ));
             }
         }
@@ -849,7 +874,7 @@ async fn mine_some_nonces_stratum(
     if let Some(nonce) = nonce {
         // Submit nonce as the exact 8 header bytes in little-endian order.
         let nonce_hex = hex::encode(nonce.to_le_bytes());
-        log.info(format!(
+        log.debug(format!(
             "Candidate share job_id={} extranonce2={} nonce_le={}",
             job.job_id, extranonce2, nonce_hex
         ));
@@ -879,6 +904,7 @@ async fn update_hashrate(server: &Server, log: &Log) {
         let num_nonces = server.metrics_nonces.load(Ordering::Acquire);
         let hashrate = num_nonces as f64 / elapsed.as_secs_f64();
         log.report_hashrate(hashrate);
+        log.hashrate(format!("{:.2} MH/s", hashrate / 1_000_000.0));
         server.metrics_nonces.store(0, Ordering::Release);
         *timestamp = SystemTime::now();
     }
@@ -1049,42 +1075,81 @@ async fn submit_block(server: &Server, block: &Block) -> Result<(), Box<dyn std:
 }
 
 impl Log {
-    pub fn new() -> Self {
+    pub fn new(no_color: bool) -> Self {
         Log {
             logs: std::sync::RwLock::new(Vec::new()),
             hashrates: std::sync::RwLock::new(Vec::new()),
+            no_color,
         }
     }
 
     pub fn log(&self, entry: impl Into<LogEntry>) {
         let mut logs = self.logs.write().unwrap();
         let entry = entry.into();
-        println!("{}", entry);
+        println!("{}", entry.display(self.no_color));
         logs.push(entry);
     }
 
-    pub fn log_str(&self, msg: impl ToString, severity: LogSeverity) {
+    pub fn log_str(&self, msg: impl ToString, severity: LogSeverity, style: LogStyle) {
         self.log(LogEntry {
             msg: msg.to_string(),
             severity,
             timestamp: chrono::Local::now(),
+            style,
         })
     }
 
     pub fn info(&self, msg: impl ToString) {
-        self.log_str(msg, LogSeverity::Info)
+        self.log_str(msg, LogSeverity::Info, LogStyle::Status)
     }
 
     pub fn warn(&self, msg: impl ToString) {
-        self.log_str(msg, LogSeverity::Warn)
+        self.log_str(msg, LogSeverity::Warn, LogStyle::Warn)
     }
 
     pub fn error(&self, msg: impl ToString) {
-        self.log_str(msg, LogSeverity::Error)
+        self.log_str(msg, LogSeverity::Error, LogStyle::Error)
     }
 
     pub fn bug(&self, msg: impl ToString) {
-        self.log_str(msg, LogSeverity::Bug)
+        self.log_str(msg, LogSeverity::Bug, LogStyle::Bug)
+    }
+
+    // Styled logging methods
+    pub fn status(&self, msg: impl ToString) {
+        self.log_str(msg, LogSeverity::Info, LogStyle::Status)
+    }
+
+    pub fn work(&self, msg: impl ToString) {
+        self.log_str(msg, LogSeverity::Info, LogStyle::Work)
+    }
+
+    pub fn difficulty(&self, msg: impl ToString) {
+        self.log_str(msg, LogSeverity::Info, LogStyle::Difficulty)
+    }
+
+    pub fn share_accepted(&self, msg: impl ToString) {
+        self.log_str(msg, LogSeverity::Info, LogStyle::ShareAccepted)
+    }
+
+    pub fn share_rejected(&self, msg: impl ToString) {
+        self.log_str(msg, LogSeverity::Warn, LogStyle::ShareRejected)
+    }
+
+    pub fn share_errored(&self, msg: impl ToString) {
+        self.log_str(msg, LogSeverity::Warn, LogStyle::ShareErrored)
+    }
+
+    pub fn hashrate(&self, msg: impl ToString) {
+        self.log_str(msg, LogSeverity::Info, LogStyle::Hashrate)
+    }
+
+    pub fn block(&self, msg: impl ToString) {
+        self.log_str(msg, LogSeverity::Info, LogStyle::Block)
+    }
+
+    pub fn debug(&self, msg: impl ToString) {
+        self.log_str(msg, LogSeverity::Info, LogStyle::Debug)
     }
 
     pub fn get_logs_and_clear(&self) -> Vec<LogEntry> {
@@ -1105,15 +1170,55 @@ impl Log {
     }
 }
 
+impl LogEntry {
+    pub fn display(&self, no_color: bool) -> String {
+        let time_str = self.timestamp.format("%H:%M:%S").to_string();
+        let style_str = self.style_label();
+        let msg = &self.msg;
+
+        let formatted = format!("[{}] [{}] {}", time_str, style_str, msg);
+
+        if no_color {
+            formatted
+        } else {
+            match self.style {
+                LogStyle::Status => formatted.cyan().to_string(),
+                LogStyle::Work => formatted.bright_white().to_string(),
+                LogStyle::Difficulty => formatted.truecolor(255, 0, 255).to_string(),
+                LogStyle::ShareAccepted => formatted.green().to_string(),
+                LogStyle::ShareRejected => formatted.yellow().to_string(),
+                LogStyle::ShareErrored => formatted.red().to_string(),
+                LogStyle::Hashrate => formatted.blue().to_string(),
+                LogStyle::Block => formatted.bright_green().bold().to_string(),
+                LogStyle::Warn => formatted.yellow().to_string(),
+                LogStyle::Error => formatted.red().to_string(),
+                LogStyle::Bug => formatted.bright_red().bold().to_string(),
+                LogStyle::Debug => formatted.truecolor(128, 128, 128).to_string(),
+            }
+        }
+    }
+
+    fn style_label(&self) -> &'static str {
+        match self.style {
+            LogStyle::Status => "STATUS",
+            LogStyle::Work => "WORK",
+            LogStyle::Difficulty => "DIFF",
+            LogStyle::ShareAccepted => "SHARE ✓",
+            LogStyle::ShareRejected => "SHARE ✗",
+            LogStyle::ShareErrored => "SHARE !",
+            LogStyle::Hashrate => "HASHRATE",
+            LogStyle::Block => "BLOCK",
+            LogStyle::Warn => "WARN",
+            LogStyle::Error => "ERROR",
+            LogStyle::Bug => "BUG",
+            LogStyle::Debug => "DEBUG",
+        }
+    }
+}
+
 impl Display for LogEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} [{:?}] {}",
-            self.timestamp.to_rfc3339(),
-            self.severity,
-            self.msg
-        )
+        write!(f, "{}", self.display(false))
     }
 }
 

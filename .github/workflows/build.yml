@@ -86,7 +86,7 @@ jobs:
           if-no-files-found: error
 
   # -----------------------------------------------------------------------
-  # Windows — windows-latest, OpenCL via the vendor-neutral Khronos SDK
+  # Windows — windows-latest, OpenCL.lib provided by the Windows SDK.
   # -----------------------------------------------------------------------
   build-windows:
     name: Build (Windows)
@@ -99,35 +99,14 @@ jobs:
       - name: Checkout bitcoinsuite (sibling)
         run: git clone --branch master --single-branch --depth 1 https://github.com/LotusiaStewardship/bitcoinsuite.git ../bitcoinsuite
 
-      # cl-sys (via ocl) requires OpenCL.lib (MSVC import library) but
-      # GitHub runners only ship OpenCL.dll (C:\Windows\System32) — there
-      # is no .lib file.  cl-sys ignores CL_LIB_DIR / CL_INCLUDE_DIR and
-      # only probes INTELOCLSDKROOT, CUDA_PATH, AMDAPPSDKROOT (appending
-      # "lib\x64"), then falls back to a pre-installed OCL_SDK_Light that
-      # ships headers-only.
-      #
-      # Build the official Khronos OpenCL-ICD-Loader from source via CMake
-      # (pre-installed on windows-latest).  This produces a correct
-      # OpenCL.lib import library that cl-sys can link against.
-      - name: Build OpenCL import library (Khronos ICD Loader)
-        shell: pwsh
-        run: |
-          $loaderDir = "$env:RUNNER_TEMP\ocl-icd-loader"
-          git clone --depth 1 https://github.com/KhronosGroup/OpenCL-ICD-Loader.git $loaderDir
-          git -C $loaderDir clone --depth 1 https://github.com/KhronosGroup/OpenCL-Headers.git external/OpenCL-Headers
+      # cl-sys (via ocl) uses #[link(name = "OpenCL")] which requires
+      # OpenCL.lib at link time.  The Windows SDK shipped with VS2022
+      # on every windows-latest runner already includes this import
+      # library (linking against C:\Windows\System32\OpenCL.dll).
+      # The MSVC linker finds it automatically via the LIB env var set
+      # by the VS developer command environment — no extra setup needed.
 
-          # Build with the default MSVC generator (pre-installed on runner)
-          cmake -S $loaderDir -B $loaderDir\build
-          cmake --build $loaderDir\build --config Release --parallel
-
-          # cl-sys searches $CUDA_PATH\lib\x64\OpenCL.lib
-          $clLibDir = "$env:RUNNER_TEMP\opencl\lib\x64"
-          New-Item -ItemType Directory -Path $clLibDir -Force | Out-Null
-          $libFile = (Get-ChildItem -Path $loaderDir\build -Filter "OpenCL.lib" -Recurse).FullName
-          Copy-Item $libFile $clLibDir\OpenCL.lib
-          echo "CUDA_PATH=$env:RUNNER_TEMP\opencl" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Install Rust stable toolchain (MSVC)
+      - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc

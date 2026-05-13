@@ -99,24 +99,40 @@ jobs:
       - name: Checkout bitcoinsuite (sibling)
         run: git clone --branch master --single-branch --depth 1 https://github.com/LotusiaStewardship/bitcoinsuite.git ../bitcoinsuite
 
-      # cl-sys (transitive dep via ocl) does not honour CL_LIB_DIR or
-      # CL_INCLUDE_DIR.  It only probes INTELOCLSDKROOT, CUDA_PATH and
-      # AMDAPPSDKROOT, then falls back to a hard-coded OCL_SDK_Light path
-      # that ships headers-only on GitHub runners (no OpenCL.lib → LNK1181).
+      # cl-sys (via ocl) requires OpenCL.lib (MSVC import library) but
+      # GitHub runners only ship OpenCL.dll (C:\Windows\System32). Neither
+      # the pre-installed OCL_SDK_Light nor the Khronos SDK binary place
+      # OpenCL.lib where cl-sys expects it (it ignores CL_LIB_DIR and only
+      # probes INTELOCLSDKROOT / CUDA_PATH / AMDAPPSDKROOT, appending
+      # "lib\x64").
       #
-      # Setting CUDA_PATH to the Khronos SDK root is the simplest reliable
-      # workaround because cl-sys appends "lib\x64" to it, matching the
-      # Khronos SDK layout exactly.
-      - name: Install OpenCL SDK (Khronos)
+      # Generate the import library from the system DLL, then set CUDA_PATH
+      # so cl-sys's build script discovers it.
+      - name: Generate OpenCL import library
         shell: pwsh
         run: |
-          $version = "2023.12.14"
-          $url = "https://github.com/KhronosGroup/OpenCL-SDK/releases/download/v${version}/OpenCL-SDK-v${version}-Win-x64.zip"
-          $dest = "$env:RUNNER_TEMP\opencl-sdk"
-          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\opencl-sdk.zip"
-          Expand-Archive -Path "$env:RUNNER_TEMP\opencl-sdk.zip" -DestinationPath $dest
-          $sdkRoot = (Get-ChildItem $dest -Directory | Select-Object -First 1).FullName
-          echo "CUDA_PATH=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $libDir = "$env:RUNNER_TEMP\opencl\lib\x64"
+          New-Item -ItemType Directory -Path $libDir -Force | Out-Null
+
+          # Resolve MSVC lib.exe and dumpbin.exe from the active toolchain
+          $vsPath = & vswhere -latest `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          $toolDir = (Resolve-Path "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64").Path
+          $libExe   = Join-Path $toolDir "lib.exe"
+          $dumpbin  = Join-Path $toolDir "dumpbin.exe"
+
+          # Extract exported symbol names from system OpenCL.dll
+          $exports = & $dumpbin /exports C:\Windows\System32\OpenCL.dll |
+            Where-Object { $_ -match '^\s+\d+\s+\d+\s+[0-9a-fA-F]+\s+(\S+)' } |
+            ForEach-Object { $matches[1] }
+
+          # Write a .def file and build the import library
+          $defPath = Join-Path $libDir "OpenCL.def"
+          @("EXPORTS") + $exports | Set-Content $defPath -Encoding ASCII
+          & $libExe /machine:x64 /def:$defPath /out:"$libDir\OpenCL.lib"
+
+          echo "CUDA_PATH=$env:RUNNER_TEMP\opencl" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install Rust stable toolchain (MSVC)
         uses: dtolnay/rust-toolchain@stable

@@ -100,41 +100,31 @@ jobs:
         run: git clone --branch master --single-branch --depth 1 https://github.com/LotusiaStewardship/bitcoinsuite.git ../bitcoinsuite
 
       # cl-sys (via ocl) requires OpenCL.lib (MSVC import library) but
-      # GitHub runners only ship OpenCL.dll (C:\Windows\System32). Neither
-      # the pre-installed OCL_SDK_Light nor the Khronos SDK binary place
-      # OpenCL.lib where cl-sys expects it (it ignores CL_LIB_DIR and only
-      # probes INTELOCLSDKROOT / CUDA_PATH / AMDAPPSDKROOT, appending
-      # "lib\x64").
+      # GitHub runners only ship OpenCL.dll (C:\Windows\System32) — there
+      # is no .lib file.  cl-sys ignores CL_LIB_DIR / CL_INCLUDE_DIR and
+      # only probes INTELOCLSDKROOT, CUDA_PATH, AMDAPPSDKROOT (appending
+      # "lib\x64"), then falls back to a pre-installed OCL_SDK_Light that
+      # ships headers-only.
       #
-      # Generate the import library from the system DLL, then set CUDA_PATH
-      # so cl-sys's build script discovers it.
-      - name: Generate OpenCL import library
+      # Build the official Khronos OpenCL-ICD-Loader from source via CMake
+      # (pre-installed on windows-latest).  This produces a correct
+      # OpenCL.lib import library that cl-sys can link against.
+      - name: Build OpenCL import library (Khronos ICD Loader)
         shell: pwsh
         run: |
-          $libDir = "$env:RUNNER_TEMP\opencl\lib\x64"
-          New-Item -ItemType Directory -Path $libDir -Force | Out-Null
+          $loaderDir = "$env:RUNNER_TEMP\ocl-icd-loader"
+          git clone --depth 1 https://github.com/KhronosGroup/OpenCL-ICD-Loader.git $loaderDir
+          git -C $loaderDir clone --depth 1 https://github.com/KhronosGroup/OpenCL-Headers.git external/OpenCL-Headers
 
-          # Resolve MSVC lib.exe and dumpbin.exe from the active toolchain.
-          # Multiple toolchain versions may be installed; pick the latest.
-          $vsPath = & vswhere -latest `
-            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-            -property installationPath
-          $toolDir = (Get-ChildItem "$vsPath\VC\Tools\MSVC" -Directory |
-            Sort-Object Name -Descending | Select-Object -First 1).FullName
-          $toolDir = Join-Path $toolDir "bin\Hostx64\x64"
-          $libExe   = Join-Path $toolDir "lib.exe"
-          $dumpbin  = Join-Path $toolDir "dumpbin.exe"
+          # Build with the default MSVC generator (pre-installed on runner)
+          cmake -S $loaderDir -B $loaderDir\build
+          cmake --build $loaderDir\build --config Release --parallel
 
-          # Extract exported symbol names from system OpenCL.dll
-          $exports = & $dumpbin /exports C:\Windows\System32\OpenCL.dll |
-            Where-Object { $_ -match '^\s+\d+\s+\d+\s+[0-9a-fA-F]+\s+(\S+)' } |
-            ForEach-Object { $matches[1] }
-
-          # Write a .def file and build the import library
-          $defPath = Join-Path $libDir "OpenCL.def"
-          @("EXPORTS") + $exports | Set-Content $defPath -Encoding ASCII
-          & $libExe /machine:x64 /def:$defPath /out:"$libDir\OpenCL.lib"
-
+          # cl-sys searches $CUDA_PATH\lib\x64\OpenCL.lib
+          $clLibDir = "$env:RUNNER_TEMP\opencl\lib\x64"
+          New-Item -ItemType Directory -Path $clLibDir -Force | Out-Null
+          $libFile = (Get-ChildItem -Path $loaderDir\build -Filter "OpenCL.lib" -Recurse).FullName
+          Copy-Item $libFile $clLibDir\OpenCL.lib
           echo "CUDA_PATH=$env:RUNNER_TEMP\opencl" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install Rust stable toolchain (MSVC)

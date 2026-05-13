@@ -114,11 +114,14 @@ jobs:
           $libDir = "$env:RUNNER_TEMP\opencl\lib\x64"
           New-Item -ItemType Directory -Path $libDir -Force | Out-Null
 
-          # Resolve MSVC lib.exe and dumpbin.exe from the active toolchain
+          # Resolve MSVC lib.exe and dumpbin.exe from the active toolchain.
+          # Multiple toolchain versions may be installed; pick the latest.
           $vsPath = & vswhere -latest `
             -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
             -property installationPath
-          $toolDir = (Resolve-Path "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64").Path
+          $toolDir = (Get-ChildItem "$vsPath\VC\Tools\MSVC" -Directory |
+            Sort-Object Name -Descending | Select-Object -First 1).FullName
+          $toolDir = Join-Path $toolDir "bin\Hostx64\x64"
           $libExe   = Join-Path $toolDir "lib.exe"
           $dumpbin  = Join-Path $toolDir "dumpbin.exe"
 

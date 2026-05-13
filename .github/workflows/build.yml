@@ -37,6 +37,7 @@ jobs:
             ocl-icd-opencl-dev opencl-headers \
             libx11-dev libxext-dev libxrandr-dev libxinerama-dev \
             libxcursor-dev libxi-dev libxss-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libwayland-dev libxkbcommon-dev \
             libgl1-mesa-dev libegl1-mesa-dev \
             pkg-config zip
@@ -100,7 +101,8 @@ jobs:
 
       # The OpenCL SDK from KhronosGroup ships headers + the stub import lib
       # that cl-sys needs. We point OPENCL_ROOT at it so the build script
-      # picks it up automatically.
+      # picks it up automatically. We also add lib/x64 to the LIB search
+      # path so rust-linker finds OpenCL.lib.
       - name: Install OpenCL SDK (Khronos)
         shell: pwsh
         run: |
@@ -112,6 +114,7 @@ jobs:
           $sdkRoot = (Get-ChildItem $dest -Directory | Select-Object -First 1).FullName
           echo "OPENCL_ROOT=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
           echo "$sdkRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          echo "LIB=$sdkRoot\lib\x64;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install Rust stable toolchain (MSVC)
         uses: dtolnay/rust-toolchain@stable

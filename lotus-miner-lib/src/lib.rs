@@ -743,20 +743,44 @@ async fn handle_stratum_line(
                 .map(|t| t.elapsed().as_millis() as u64)
                 .unwrap_or(0);
 
-            if err.is_some() && !err.is_none_or(|e| e.is_null()) {
-                share_stats.errored += 1;
-                let err_msg = err.unwrap().to_string();
-                let reason = if err_msg.contains("Low difficulty") { "low_difficulty"
-                    } else if err_msg.contains("stale") { "stale_job"
-                    } else if err_msg.contains("duplicate") { "duplicate_share"
-                    } else { "unknown" };
-                let totals = format!("total: {}✓ / {}✗ / {}!",
-                    share_stats.accepted, share_stats.rejected, share_stats.errored);
-                server.log().share_errored(format!(
-                    "#{} errored | job:{} | reason:{} | {}ms | {}",
-                    share_num, job_id, reason, latency_ms, totals
-                ));
-            } else if let Some(result_bool) = v.get("result").and_then(|r| r.as_bool()) {
+            // Extract a human-readable reason from the stratum error field.
+            // Pools return error as [code, "message", null] or sometimes just a string.
+            let extract_reason = || -> String {
+                let Some(err_val) = err else {
+                    return "unknown".to_string();
+                };
+                // Try to pull the message string from [code, "message", null]
+                if let Some(arr) = err_val.as_array() {
+                    if arr.len() >= 2 {
+                        if let Some(msg) = arr[1].as_str() {
+                            return msg.to_string();
+                        }
+                    }
+                }
+                // Fallback: use the raw error string
+                err_val.to_string()
+            };
+
+            let classify_rejection = |reason: &str| -> &'static str {
+                let r = reason.to_lowercase();
+                if r.contains("low difficulty") || r.contains("difficulty") {
+                    "low_difficulty"
+                } else if r.contains("stale") || r.contains("job not found") {
+                    "stale_job"
+                } else if r.contains("duplicate") {
+                    "duplicate_share"
+                } else if r.contains("invalid") || r.contains("wrong") {
+                    "invalid_share"
+                } else {
+                    "other"
+                }
+            };
+
+            // Check `result` first — it is the authoritative indicator of share status.
+            // - result=true  → accepted (error is null)
+            // - result=false → rejected (error contains the rejection reason)
+            // - result=null  → errored (protocol/server error, no share evaluation)
+            if let Some(result_bool) = v.get("result").and_then(|r| r.as_bool()) {
                 if result_bool {
                     share_stats.accepted += 1;
                     let totals = format!("total: {}✓ / {}✗ / {}!",
@@ -767,14 +791,26 @@ async fn handle_stratum_line(
                     ));
                 } else {
                     share_stats.rejected += 1;
+                    let reason = extract_reason();
+                    let category = classify_rejection(&reason);
                     let totals = format!("total: {}✓ / {}✗ / {}!",
                         share_stats.accepted, share_stats.rejected, share_stats.errored);
                     server.log().share_rejected(format!(
-                        "#{} rejected | job:{} | {}ms | {}",
-                        share_num, job_id, latency_ms, totals
+                        "#{} rejected | job:{} | reason:{} ({}) | {}ms | {}",
+                        share_num, job_id, category, reason, latency_ms, totals
                     ));
                 }
+            } else if err.is_some() && !err.is_none_or(|e| e.is_null()) {
+                // result is null/missing and error is set → genuine protocol error
+                share_stats.errored += 1;
+                let totals = format!("total: {}✓ / {}✗ / {}!",
+                    share_stats.accepted, share_stats.rejected, share_stats.errored);
+                server.log().share_errored(format!(
+                    "#{} errored | job:{} | error:{} | {}ms | {}",
+                    share_num, job_id, err.unwrap(), latency_ms, totals
+                ));
             } else {
+                // Neither result nor error present → malformed response
                 share_stats.errored += 1;
                 let totals = format!("total: {}✓ / {}✗ / {}!",
                     share_stats.accepted, share_stats.rejected, share_stats.errored);

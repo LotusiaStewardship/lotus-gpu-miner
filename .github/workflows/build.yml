@@ -4,8 +4,6 @@ on:
   push:
     branches: ["master"]
     tags: ["v*.*.*"]
-  pull_request:
-    branches: ["master"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -74,7 +72,6 @@ jobs:
       #   kernels/
       #     *.cl  (OpenCL kernels)
       - name: Package release ZIP
-        if: github.event_name == 'push'
         run: |
           mkdir -p staging
           cp target/release/lotus-miner-cli staging/
@@ -83,7 +80,6 @@ jobs:
           zip -r ../lotus-miner-linux-x86_64.zip .
 
       - name: Upload Linux release ZIP
-        if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: lotus-miner-linux-x86_64
@@ -153,7 +149,6 @@ jobs:
       #   kernels/
       #     *.cl  (OpenCL kernels used at runtime on Windows)
       - name: Package release ZIP
-        if: github.event_name == 'push'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path staging | Out-Null
@@ -162,7 +157,6 @@ jobs:
           Compress-Archive -Path staging\* -DestinationPath lotus-miner-windows-x86_64.zip
 
       - name: Upload Windows release ZIP
-        if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: lotus-miner-windows-x86_64
@@ -221,7 +215,6 @@ jobs:
       #     *.metal  (Metal kernels used on macOS)
       #     *.cl     (OpenCL kernels also present)
       - name: Package release ZIP
-        if: github.event_name == 'push'
         run: |
           mkdir -p staging
           cp target/release/lotus-miner-cli staging/
@@ -230,7 +223,6 @@ jobs:
           zip -r ../lotus-miner-macos-x86_64.zip .
 
       - name: Upload macOS release ZIP
-        if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: lotus-miner-macos-x86_64

@@ -107,7 +107,7 @@ jobs:
       # cl-sys (via ocl) requires OpenCL.lib for #[link(name = "OpenCL")].
       - uses: ilammy/msvc-dev-cmd@v1
         with:
-          winsdk: '10.0.19041.0'
+          sdk: '10.0.19041.0'
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable

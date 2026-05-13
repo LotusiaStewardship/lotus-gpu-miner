@@ -101,10 +101,13 @@ jobs:
         run: git clone --branch master --single-branch --depth 1 https://github.com/LotusiaStewardship/bitcoinsuite.git ../bitcoinsuite
 
       # Set up the MSVC developer environment (vcvarsall.bat).
-      # This configures INCLUDE, LIB, and PATH so the MSVC linker
-      # can find Windows SDK import libraries — including OpenCL.lib
-      # that cl-sys (via ocl) requires via #[link(name = "OpenCL")].
+      # Pin Windows SDK 10.0.19041.0 — it is the last Windows 10 SDK that
+      # still ships OpenCL.lib.  Newer SDKs (10.0.22000+) dropped it, and
+      # msvc-dev-cmd picks the latest by default (10.0.26100 on this image).
+      # cl-sys (via ocl) requires OpenCL.lib for #[link(name = "OpenCL")].
       - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          winsdk: '10.0.19041.0'
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable

@@ -108,11 +108,33 @@ jobs:
       - name: Add OpenCL.lib to linker search path
         shell: pwsh
         run: |
-          $libPath = (Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\Lib" -Filter "OpenCL.lib" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match "um\\x64" } | Select-Object -First 1).FullName
-          if (-not $libPath) { Write-Error "OpenCL.lib not found in Windows SDK"; exit 1 }
-          $libDir = Split-Path $libPath -Parent
-          echo "RUSTFLAGS=-L native=$libDir" | Out-File -FilePath `$env:GITHUB_ENV -Append
-          echo "Found OpenCL.lib at: $libPath"
+          # Search multiple base paths using environment variables so we
+          # survive runner-image changes (windows-2022 → windows-2025).
+          $searchBases = @()
+          if ($env:WindowsSdkDir) {
+              $searchBases += Join-Path $env:WindowsSdkDir "Lib"
+          }
+          $searchBases += "${env:ProgramFiles(x86)}\Windows Kits\10\Lib"
+          $searchBases += "${env:ProgramFiles}\Windows Kits\10\Lib"
+
+          $libPath = $null
+          foreach ($base in $searchBases) {
+              if (Test-Path $base) {
+                  $libPath = Get-ChildItem -Path $base -Filter "OpenCL.lib" -Recurse -ErrorAction SilentlyContinue |
+                      Where-Object { $_.FullName -match "um\\x64" } |
+                      Select-Object -First 1
+                  if ($libPath) { break }
+              }
+          }
+
+          if (-not $libPath) {
+              Write-Error "OpenCL.lib not found. Searched: $($searchBases -join ', ')"
+              exit 1
+          }
+
+          $libDir = Split-Path $libPath.FullName -Parent
+          echo "RUSTFLAGS=-L native=$libDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Output "Found OpenCL.lib at: $($libPath.FullName)"
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable

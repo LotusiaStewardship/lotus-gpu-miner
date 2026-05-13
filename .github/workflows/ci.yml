@@ -15,14 +15,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
+      # Clone bitcoinsuite as a sibling directory. We use `git clone` instead
+      # of actions/checkout because the action rejects paths outside
+      # GITHUB_WORKSPACE (../bitcoinsuite).
       - name: Checkout bitcoinsuite (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: LotusiaStewardship/bitcoinsuite
-          ref: master
-          path: ../bitcoinsuite
+        run: git clone --branch master --single-branch --depth 1 https://github.com/LotusiaStewardship/bitcoinsuite.git ../bitcoinsuite
 
       - name: Install system dependencies
         run: |

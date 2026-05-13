@@ -20,17 +20,15 @@ jobs:
     steps:
       # Check out lotus-gpu-miner into the default workspace path:
       #   /home/runner/work/lotus-gpu-miner/lotus-gpu-miner
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Clone bitcoinsuite as a sibling directory so the path-based Cargo
-      # dependency resolves correctly at build time:
+      # dependency resolves correctly at build time.
+      # We use `git clone` instead of actions/checkout because the action
+      # rejects paths outside GITHUB_WORKSPACE (../bitcoinsuite).
       #   /home/runner/work/lotus-gpu-miner/bitcoinsuite
       - name: Checkout bitcoinsuite (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: LotusiaStewardship/bitcoinsuite
-          ref: master
-          path: ../bitcoinsuite
+        run: git clone --branch master --single-branch --depth 1 https://github.com/LotusiaStewardship/bitcoinsuite.git ../bitcoinsuite
 
       - name: Install system dependencies
         run: |
@@ -94,14 +92,11 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
+      # Clone bitcoinsuite as a sibling directory (see Linux job for rationale).
       - name: Checkout bitcoinsuite (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: LotusiaStewardship/bitcoinsuite
-          ref: master
-          path: ../bitcoinsuite
+        run: git clone --branch master --single-branch --depth 1 https://github.com/LotusiaStewardship/bitcoinsuite.git ../bitcoinsuite
 
       # The OpenCL SDK from KhronosGroup ships headers + the stub import lib
       # that cl-sys needs. We point OPENCL_ROOT at it so the build script
@@ -171,14 +166,11 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
+      # Clone bitcoinsuite as a sibling directory (see Linux job for rationale).
       - name: Checkout bitcoinsuite (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: LotusiaStewardship/bitcoinsuite
-          ref: master
-          path: ../bitcoinsuite
+        run: git clone --branch master --single-branch --depth 1 https://github.com/LotusiaStewardship/bitcoinsuite.git ../bitcoinsuite
 
       # OpenCL.framework and Cocoa/CGL are present on every macOS runner.
       # pkg-config is still needed by some transitive build scripts.

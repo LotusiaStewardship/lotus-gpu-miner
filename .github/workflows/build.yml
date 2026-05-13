@@ -99,10 +99,14 @@ jobs:
       - name: Checkout bitcoinsuite (sibling)
         run: git clone --branch master --single-branch --depth 1 https://github.com/LotusiaStewardship/bitcoinsuite.git ../bitcoinsuite
 
-      # The OpenCL SDK from KhronosGroup ships headers + the stub import lib
-      # that cl-sys needs. We set CL_INCLUDE_DIR / CL_LIB_DIR explicitly
-      # to override cl-sys's auto-detection, which otherwise picks up the
-      # pre-installed OCL_SDK_Light (headers only, no import library).
+      # cl-sys (transitive dep via ocl) does not honour CL_LIB_DIR or
+      # CL_INCLUDE_DIR.  It only probes INTELOCLSDKROOT, CUDA_PATH and
+      # AMDAPPSDKROOT, then falls back to a hard-coded OCL_SDK_Light path
+      # that ships headers-only on GitHub runners (no OpenCL.lib → LNK1181).
+      #
+      # Setting CUDA_PATH to the Khronos SDK root is the simplest reliable
+      # workaround because cl-sys appends "lib\x64" to it, matching the
+      # Khronos SDK layout exactly.
       - name: Install OpenCL SDK (Khronos)
         shell: pwsh
         run: |
@@ -112,9 +116,7 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\opencl-sdk.zip"
           Expand-Archive -Path "$env:RUNNER_TEMP\opencl-sdk.zip" -DestinationPath $dest
           $sdkRoot = (Get-ChildItem $dest -Directory | Select-Object -First 1).FullName
-          echo "CL_INCLUDE_DIR=$sdkRoot\include" | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "CL_LIB_DIR=$sdkRoot\lib\x64" | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "$sdkRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          echo "CUDA_PATH=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install Rust stable toolchain (MSVC)
         uses: dtolnay/rust-toolchain@stable

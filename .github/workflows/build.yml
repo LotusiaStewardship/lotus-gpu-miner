@@ -86,11 +86,12 @@ jobs:
           if-no-files-found: error
 
   # -----------------------------------------------------------------------
-  # Windows — windows-latest, OpenCL.lib provided by the Windows SDK.
+  # Windows — windows-2022 (Windows 10 SDK ships OpenCL.lib;
+  #   Windows 11 SDK on windows-2025/windows-latest does not).
   # -----------------------------------------------------------------------
   build-windows:
     name: Build (Windows)
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - uses: actions/checkout@v6

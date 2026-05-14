@@ -120,6 +120,9 @@ jobs:
         shell: pwsh
         run: |
           $libDir = Join-Path $env:WindowsSdkDir "lib\$($env:UCRTVersion)\um\x64"
+          # Use forward slashes — rustc/cargo accept them on Windows,
+          # and backslashes would be TOML escape chars in config.toml.
+          $libDir = $libDir -replace '\\', '/'
           mkdir .cargo | Out-Null
           @"
           [target.x86_64-pc-windows-msvc]

@@ -771,6 +771,16 @@ async fn handle_stratum_line(
                     "duplicate_share"
                 } else if r.contains("invalid") || r.contains("wrong") {
                     "invalid_share"
+                } else if r.contains("unauthorized") {
+                    "unauthorized_worker"
+                } else if r.contains("ntime") {
+                    "ntime_mismatch"
+                } else if r.contains("merkle") || r.contains("mrklroot") {
+                    "bad_merkle_root"
+                } else if r.contains("block-submit") || r.contains("high-hash") {
+                    "node_rejected"
+                } else if r.contains("unsupported") {
+                    "unsupported"
                 } else {
                     "other"
                 }

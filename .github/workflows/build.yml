@@ -110,13 +110,22 @@ jobs:
       # rustc does NOT read the MSVC LIB environment variable.  cl-sys's
       # build.rs only searches vendor SDK paths (INTELOCLSDKROOT,
       # CUDA_PATH, AMDAPPSDKROOT) and skips the Windows SDK entirely.
-      # We must explicitly pass -L so rustc can find OpenCL.lib.
-      - name: Add Windows SDK OpenCL.lib to rustc search path
+      # We must add the SDK lib directory via -L.
+      #
+      # RUSTFLAGS cannot be used because cargo splits it on whitespace,
+      # which breaks paths containing spaces ("Program Files (x86)").
+      # Instead, write a .cargo/config.toml with rustflags as a TOML
+      # array — each element is a separate argument, spaces preserved.
+      - name: Add Windows SDK OpenCL.lib to cargo rustflags
         shell: pwsh
         run: |
           $libDir = Join-Path $env:WindowsSdkDir "lib\$($env:UCRTVersion)\um\x64"
-          Write-Output "RUSTFLAGS=-L native=$libDir" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Output "Adding rustc search path: $libDir"
+          mkdir .cargo | Out-Null
+          @"
+          [target.x86_64-pc-windows-msvc]
+          rustflags = ["-L", "native=$libDir"]
+          "@ | Set-Content -Path .cargo/config.toml
+          Write-Output "cargo config: .cargo/config.toml -> -L native=$libDir"
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
